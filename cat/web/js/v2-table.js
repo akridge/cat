@@ -258,7 +258,12 @@
       // Also add drag-resize handle to annotation panel
       const panel = document.getElementById('annotationFormPanel');
       if (panel && !panel.querySelector('.resize-handle')) {
-        panel.style.position = 'absolute'; // ensure positioning
+        // Deliberately NOT setting panel.style.position here. `.annotation-panel`
+        // is already position:absolute in annotation-panels.css, so the inline
+        // write was redundant in the default float layout — and because inline
+        // styles beat stylesheets it permanently defeated the two layouts that
+        // reposition the panel: dock-right's position:fixed, and the popout's
+        // position:static (which only survived by shouting !important at it).
         const handle = document.createElement('div');
         handle.className = 'resize-handle';
         handle.title = 'Drag to resize';

@@ -210,6 +210,13 @@
 
   // ── Init ─────────────────────────────────────────────────
   function init() {
+    // A popout window has no map — `map` there is a no-op stub whose
+    // getContainer() returns null, so this used to die on the line below with
+    // "Cannot read properties of null", skipping the rest of init (including
+    // the toggleBulkMode wrapper) on every popout open. Lasso selection is a
+    // drag-on-the-map tool; there is nothing here for it to attach to.
+    if (window._catPopoutMode) return;
+
     _injectStyles();
 
     // Wait for the v2 toolbar to be injected by v2-bulk.js
@@ -220,6 +227,7 @@
 
         // Attach mouse events to the map container
         const container = map.getContainer();
+        if (!container) { console.warn('v2-lasso: no map container; lasso disabled'); return; }
         container.addEventListener('mousedown', _onMouseDown);
         container.addEventListener('mousemove', _onMouseMove);
         container.addEventListener('mouseup', _onMouseUp);

@@ -285,7 +285,10 @@
       loadingIcon.textContent = '🗺️';
 
       document.getElementById('uploadPanel').style.display = 'none';
-      document.getElementById('mapLayersPanel').style.display = 'block';
+      // '' rather than 'block': the layers sidebar (annotation-runtime-layers-sidebar.js)
+      // styles this panel as a flex column when docked, and an inline 'block'
+      // would beat that stylesheet.
+      document.getElementById('mapLayersPanel').style.display = '';
       document.getElementById('annotationFormPanel').style.display = 'block';
       document.getElementById('saveProjectBtn').style.display = 'block';
 
@@ -388,8 +391,10 @@
         loadingIcon.textContent = '🗺️';
         
         // Hide upload panel, show map layers and annotation form
+        // ('' not 'block' — see the DB-load path above: the docked layers
+        // sidebar needs the stylesheet, not an inline display, to win.)
         document.getElementById('uploadPanel').style.display = 'none';
-        document.getElementById('mapLayersPanel').style.display = 'block';
+        document.getElementById('mapLayersPanel').style.display = '';
         document.getElementById('annotationFormPanel').style.display = 'block';
         document.getElementById('saveProjectBtn').style.display = 'block';
         

@@ -463,10 +463,31 @@
       const getF = (id) => { const v = getV(id); return (v !== null && v !== '') ? parseFloat(v) : null; };
 
       const timeSeconds = (typeof getAnnotationTime === 'function') ? getAnnotationTime() : 0;
+
+      // Drawn line length in metres, same as the main-window save path. The
+      // popout has no Leaflet layer to measure, so compute it from the
+      // broadcast GeoJSON coordinates instead — without this, lines saved from
+      // the popout landed in the database with an empty LINE_LENGTH_M while
+      // identical lines saved from the main window did not.
+      let line_length_m = null;
+      try {
+        const g = window._popoutGeometry;
+        if (g && g.type === 'LineString' && Array.isArray(g.coordinates) && g.coordinates.length > 1) {
+          let meters = 0;
+          for (let i = 0; i < g.coordinates.length - 1; i++) {
+            const a = L.latLng(g.coordinates[i][1], g.coordinates[i][0]);
+            const b = L.latLng(g.coordinates[i + 1][1], g.coordinates[i + 1][0]);
+            meters += a.distanceTo(b);
+          }
+          line_length_m = parseFloat(meters.toFixed(3));
+        }
+      } catch (e) { /* leave null — length is optional metadata */ }
+
       const annotationData = {
         colony_id: 0,
         geometry: window._popoutGeometry,
         type: window._popoutShapeType || 'polygon',
+        line_length_m,
         analyst, obs_year: parseInt(obs_year), mission_id, site,
         transect: getV('transect') || null,
         segment: getI('segment'),
@@ -508,11 +529,13 @@
 
         window._popoutGeometry = null;
         window._popoutShapeType = null;
-        // Return to waiting state
-        const wi = document.getElementById('popoutWaitingIndicator');
-        if (wi) wi.classList.add('visible');
-        const fc = document.getElementById('formSectionContent');
-        if (fc) fc.style.display = 'none';
+        // Return to waiting state. Toggling both halves through the popout
+        // module's single state setter is what makes the form come back on the
+        // next shape — this used to hide #formSectionContent directly, and
+        // nothing ever un-hid it, so the popout could only ever save once.
+        if (typeof window._catSetPopoutFormState === 'function') {
+          window._catSetPopoutFormState(false);
+        }
 
         if (typeof incrementAnnotationCount === 'function') incrementAnnotationCount();
         if (typeof resetAnnotationTimer === 'function') resetAnnotationTimer();
