@@ -119,3 +119,20 @@ secrets.yaml
 credentials.json
 *.pem
 *.key
+
+# Reference folder (old_app backup, not part of main codebase) - top-level only
+/reference*/
+
+# Explicitly track app reference data CSVs
+!cat/data/reference/*.csv
+
+# Local Oracle data volumes
+oracle-data/
+
+# Backup staging directory
+backups/
+
+# Exports directory
+exports/
+.superpowers/
+run.txt
