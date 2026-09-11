@@ -23,6 +23,7 @@ place.
 
 import hashlib
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -54,6 +55,16 @@ DEM_COLORMAP = "viridis"
 # bytes (same reasoning as the disk cache), and a stale card thumbnail is the
 # least consequential thing in the app.
 CACHE_CONTROL = "public, max-age=86400"
+
+# Upper bound on the cache directory. Nothing here is precious -- an evicted
+# entry costs one re-render -- but the process runs in a container with a
+# fixed disk, so an unbounded cache is a slow-motion outage. At ~5-55 KB a
+# thumbnail this holds thousands, far more than any project list needs.
+# Override with CAT_THUMBNAIL_CACHE_MB for a deployment with a smaller disk.
+try:
+    CACHE_BUDGET_BYTES = int(float(os.environ.get("CAT_THUMBNAIL_CACHE_MB", "200")) * 1024 * 1024)
+except ValueError:
+    CACHE_BUDGET_BYTES = 200 * 1024 * 1024
 
 
 def _cache_path(url: str, size: int) -> Path:
@@ -186,7 +197,60 @@ def render_cached_thumbnail(url: str, size: int, refresh: bool = False) -> Path:
     tmp = path.with_suffix(f".{hashlib.sha1(png[:64]).hexdigest()[:8]}.tmp")
     tmp.write_bytes(png)
     tmp.replace(path)
+
+    _evict_if_over_budget()
     return path
+
+
+def _evict_if_over_budget() -> None:
+    """Keep the cache directory under CACHE_BUDGET_BYTES, oldest out first.
+
+    Only runs after a miss (a hit never grows the directory), so the scan
+    cost lands on the render path that just spent a second reading a COG,
+    not on the hits that matter for a list view. Sweeps down to 80% of the
+    budget rather than to exactly the budget, so a full cache doesn't
+    re-scan on every single subsequent render.
+
+    Eviction is by mtime, i.e. by when the entry was written. That is
+    approximate LRU at best -- serving a cached file doesn't bump its
+    mtime -- but the cost of being wrong is one re-render, which does not
+    justify tracking access times.
+    """
+    try:
+        entries = []
+        total = 0
+        for f in THUMBNAIL_CACHE_DIR.glob("*.png"):
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, f))
+            total += st.st_size
+
+        if total <= CACHE_BUDGET_BYTES:
+            return
+
+        target = int(CACHE_BUDGET_BYTES * 0.8)
+        entries.sort()  # oldest first
+        removed = 0
+        for _mtime, size, f in entries:
+            if total <= target:
+                break
+            try:
+                f.unlink()
+                total -= size
+                removed += 1
+            except OSError:
+                continue
+
+        if removed:
+            logger.info(
+                "Thumbnail cache over %.0f MB, evicted %d entries (now %.0f MB)",
+                CACHE_BUDGET_BYTES / 1048576, removed, total / 1048576,
+            )
+    except Exception as exc:
+        # Never fail a render because housekeeping failed.
+        logger.warning("Thumbnail cache eviction failed: %s", exc)
 
 
 def _png_response(path: Path, filename: str) -> FileResponse:

@@ -2,6 +2,7 @@
 
 from datetime import datetime
 import json
+import logging
 import tempfile
 import zipfile
 import os
@@ -48,6 +49,8 @@ def _numpy_safe_json(obj):
         return None
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/db", tags=["db-projects"])
 
@@ -437,8 +440,29 @@ def list_projects(
     # ORDER BY clauses above (unqualified column names, shared with the count
     # query) don't need touching, and so cat_users.created_at can't collide
     # with cat_projects.created_at under SELECT *.
+    # Per-project tallies the project list renders on each card (annotation
+    # count, imagery/overlay counts, when it was last worked on). These are
+    # correlated subqueries in the OUTER select, deliberately: inside the
+    # paged subquery they would be evaluated for every project matching the
+    # filter before paging cut it to one screen's worth. Out here they run
+    # at most `limit` times, each an indexed lookup on project_id.
+    #
+    # Counting in SQL rather than reusing aggregate_annotations() (which the
+    # QC page uses) matters: that helper pulls every annotation's CLOBs back
+    # into Python, so a list of 20 projects would drag thousands of geometry
+    # blobs across the wire to render twenty little "412 annotations" chips.
     sql = """
-        SELECT p.*, u.display_name AS owner_display_name, u.username AS owner_username
+        SELECT p.*, u.display_name AS owner_display_name, u.username AS owner_username,
+            (SELECT COUNT(*) FROM cat_annotations a
+              WHERE a.project_id = p.project_id AND a.deleted_at IS NULL) AS annotation_count,
+            (SELECT COUNT(*) FROM cat_project_assets s
+              WHERE s.project_id = p.project_id) AS asset_count,
+            (SELECT COUNT(*) FROM cat_overlay_layers l
+              WHERE l.project_id = p.project_id) AS overlay_count,
+            (SELECT COUNT(*) FROM cat_project_collaborators c
+              WHERE c.project_id = p.project_id) AS collaborator_count,
+            (SELECT MAX(NVL(a.updated_at, a.created_at)) FROM cat_annotations a
+              WHERE a.project_id = p.project_id AND a.deleted_at IS NULL) AS last_annotated_at
         FROM (
             SELECT *
             FROM cat_projects
@@ -450,6 +474,9 @@ def list_projects(
         ORDER BY p.{order_col} {order_dir}, p.project_id DESC
     """.format(where_sql=where_sql, order_col=order_col, order_dir=order_dir)
     rows = fetch_all(sql, {**filter_params, "limit": limit, "offset": offset})
+
+    _attach_incomplete_counts(rows)
+
     return {
         "success": True,
         "count": len(rows),
@@ -465,6 +492,54 @@ def list_projects(
         "scope": scope,
         "projects": [_normalize_project_row(r) for r in rows],
     }
+
+
+def _attach_incomplete_counts(rows: List[Dict[str, Any]]) -> None:
+    """Add `incomplete_count` (annotations with no species code) to each row.
+
+    Deliberately a SECOND query rather than another subselect in the list
+    SQL above. Counting these needs to look inside properties_json, which
+    means Oracle's JSON_VALUE — a function whose availability over a plain
+    CLOB varies with database version and whether the column carries an
+    IS JSON constraint. Folding it into the main query would mean that on a
+    database where it isn't available, the entire project list 500s instead
+    of merely lacking a progress bar.
+
+    So: run it separately, swallow failure, and leave `incomplete_count`
+    absent. The card reads a missing value as "no progress data" and
+    renders the annotation count alone (see renderDbProjectList in
+    project_creator.html).
+
+    Modifies `rows` in place; callers normalize afterwards.
+    """
+    project_ids = [r.get("project_id") for r in rows if r.get("project_id") is not None]
+    if not project_ids:
+        return
+
+    # One bind per id, never string interpolation — same rule as
+    # aggregate_annotations().
+    id_binds = {f"icid{i}": pid for i, pid in enumerate(project_ids)}
+    in_clause = ", ".join(f":{k}" for k in id_binds)
+
+    try:
+        counts = fetch_all(
+            f"""
+            SELECT project_id, COUNT(*) AS incomplete_count
+            FROM cat_annotations
+            WHERE project_id IN ({in_clause})
+              AND deleted_at IS NULL
+              AND NVL(TRIM(JSON_VALUE(properties_json, '$.spcode')), '-') IN ('-', '')
+            GROUP BY project_id
+            """,
+            id_binds,
+        )
+    except Exception as exc:
+        logger.info("Skipping incomplete_count (JSON query unavailable): %s", exc)
+        return
+
+    by_id = {c["project_id"]: int(c.get("incomplete_count") or 0) for c in counts}
+    for row in rows:
+        row["incomplete_count"] = by_id.get(row.get("project_id"), 0)
 
 
 def _visible_project_where(current_user: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:

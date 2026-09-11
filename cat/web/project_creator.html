@@ -658,7 +658,10 @@
             </select>
           </div>
           <div id="dbProjectMeta" style="font-size:12px; color:#64748b; margin-bottom:8px;"></div>
-          <div id="dbProjectList" style="max-height: 260px; overflow-y:auto; border:1px solid #dbeafe; border-radius:6px; background:#fff;">
+          <!-- Was max-height:260px, sized for the old text-only rows. A row
+               now carries a thumbnail, chips and a progress bar (~105px), so
+               that cap showed barely two projects before scrolling. -->
+          <div id="dbProjectList" style="max-height: min(62vh, 620px); overflow-y:auto; border:1px solid #dbeafe; border-radius:6px; background:#fff;">
             <div style="padding: 14px; color:#64748b; font-size:13px;">Loading projects...</div>
           </div>
         </div>
@@ -1549,6 +1552,34 @@
       }, 250);
     }
 
+    // ── Project card helpers ──────────────────────────────────────────
+    function chip(text, variant, title) {
+      const muted = variant === 'muted';
+      return `<span title="${title ? String(title).replace(/"/g, '&quot;') : ''}" style="` +
+        'font-size:11px; padding:2px 8px; border-radius:999px; white-space:nowrap;' +
+        `background:${muted ? '#f1f5f9' : '#eff6ff'}; color:${muted ? '#64748b' : '#1e40af'};` +
+        `border:1px solid ${muted ? '#e2e8f0' : '#dbeafe'};">${text}</span>`;
+    }
+
+    // "3 days ago" beats an absolute timestamp when you're scanning a list
+    // for the project you were last in. Absolute time stays in the tooltip.
+    function relativeTime(value) {
+      const then = new Date(value);
+      if (isNaN(then.getTime())) return null;
+      const seconds = (Date.now() - then.getTime()) / 1000;
+      // A DB clock slightly ahead of the browser shouldn't read "in 4 seconds".
+      if (seconds < 60) return 'just now';
+      const units = [
+        ['year', 31536000], ['month', 2592000], ['week', 604800],
+        ['day', 86400], ['hour', 3600], ['minute', 60],
+      ];
+      for (const [name, secs] of units) {
+        const n = Math.floor(seconds / secs);
+        if (n >= 1) return `${n} ${name}${n === 1 ? '' : 's'} ago`;
+      }
+      return 'just now';
+    }
+
     function renderDbProjectList(projects) {
       const listContainer = document.getElementById('dbProjectList');
       if (!listContainer) return;
@@ -1594,18 +1625,64 @@
             })
           : '';
 
+        // Tallies from GET /api/db/projects. Before these existed a project
+        // with 412 annotations looked identical to an empty one.
+        const annCount = Number(project.annotation_count) || 0;
+        const assetCount = Number(project.asset_count) || 0;
+        const overlayCount = Number(project.overlay_count) || 0;
+        const collabCount = Number(project.collaborator_count) || 0;
+
+        const chips = [];
+        chips.push(chip(`${annCount.toLocaleString()} annotation${annCount === 1 ? '' : 's'}`,
+                        annCount ? '' : 'muted'));
+        if (assetCount) chips.push(chip(`${assetCount} asset${assetCount === 1 ? '' : 's'}`));
+        if (overlayCount) chips.push(chip(`${overlayCount} overlay${overlayCount === 1 ? '' : 's'}`));
+        if (collabCount) chips.push(chip(`+${collabCount} collaborator${collabCount === 1 ? '' : 's'}`));
+
+        // Prefer "when was this last worked on" over "when was the record
+        // created" — that's the question someone scanning the list is
+        // actually asking. Created date stays as the tooltip.
+        const lastTouched = project.last_annotated_at || project.updated_at || null;
+        if (lastTouched) {
+          const rel = relativeTime(lastTouched);
+          if (rel) chips.push(chip(rel, 'muted', new Date(lastTouched).toLocaleString()));
+        }
+
+        // Completeness bar. incomplete_count is ABSENT (not 0) when the
+        // database couldn't answer the JSON query — see
+        // _attach_incomplete_counts in cat/api/db_projects.py — so check for
+        // undefined rather than falsiness, or an unanswerable project would
+        // claim to be 100% done.
+        let progress = '';
+        if (annCount > 0 && project.incomplete_count !== undefined && project.incomplete_count !== null) {
+          const incomplete = Number(project.incomplete_count) || 0;
+          const done = Math.max(0, annCount - incomplete);
+          const pct = Math.round((done / annCount) * 100);
+          const complete = incomplete === 0;
+          progress = `
+            <div style="margin-top:7px; max-width:320px;" title="${done} of ${annCount} annotations have a species code">
+              <div style="height:5px; border-radius:3px; background:#e2e8f0; overflow:hidden;">
+                <div style="height:100%; width:${pct}%; background:${complete ? '#00a91c' : 'linear-gradient(90deg,#005ea2,#00bde3)'};"></div>
+              </div>
+              <div style="font-size:11px; color:#64748b; margin-top:3px; font-variant-numeric:tabular-nums;">
+                ${complete
+                  ? `All ${annCount.toLocaleString()} annotations have a species`
+                  : `${done.toLocaleString()} of ${annCount.toLocaleString()} complete · ${incomplete.toLocaleString()} missing species`}
+              </div>
+            </div>`;
+        }
+
         return `
           <div style="padding: 12px; border-bottom: 1px solid #e2e8f0; display:flex; justify-content:space-between; gap:12px; align-items:center;">
-            <div style="display:flex; gap:12px; align-items:center; min-width:0;">
+            <div style="display:flex; gap:12px; align-items:flex-start; min-width:0;">
             ${thumb}
             <div style="min-width:0;">
-              <div style="font-weight:600; color:#0f172a; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+              <div style="font-weight:600; color:#0f172a; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="Created: ${created}">
                 #${project.project_id} • ${project.project_name || 'Untitled'}
               </div>
               ${metaLine}
-              <div style="font-size:11px; color:#64748b; margin-top:2px;">
-                Created: ${created}
-              </div>
+              <div style="display:flex; flex-wrap:wrap; gap:5px; margin-top:5px;">${chips.join('')}</div>
+              ${progress}
             </div>
             </div>
             <!-- Delete used to sit between Report and Open, i.e. directly
