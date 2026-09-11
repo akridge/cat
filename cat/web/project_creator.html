@@ -6,6 +6,8 @@
   <meta name="viewport" content="initial-scale=1.0">
   <link rel="stylesheet" href="css/cat-theme.css" />
   <link rel="stylesheet" href="css/cat-thumbnail.css" />
+  <link rel="stylesheet" href="/vendor/leaflet/leaflet.css" />
+  <link rel="stylesheet" href="css/project-drawer.css" />
   <style>
     * {
       box-sizing: border-box;
@@ -1552,6 +1554,16 @@
       }, 250);
     }
 
+    // Open the details drawer for a project, seeding it with the row data
+    // the list already has so its header paints immediately instead of
+    // waiting on a round trip.
+    function showProjectDetails(projectId) {
+      if (typeof window.openProjectDrawer !== 'function') return;
+      const seed = (dbProjects || []).find(p => String(p.project_id) === String(projectId)) || null;
+      window.openProjectDrawer(projectId, seed);
+    }
+    window.showProjectDetails = showProjectDetails;
+
     // ── Project card helpers ──────────────────────────────────────────
     function chip(text, variant, title) {
       const muted = variant === 'muted';
@@ -1579,6 +1591,9 @@
       }
       return 'just now';
     }
+    // The details drawer (js/project-drawer.js) reuses this so a timestamp
+    // is never worded one way on a card and another way in the panel.
+    window.relativeTime = relativeTime;
 
     function renderDbProjectList(projects) {
       const listContainer = document.getElementById('dbProjectList');
@@ -1672,9 +1687,16 @@
             </div>`;
         }
 
+        // Clicking the row's identity area opens the details drawer. The
+        // action buttons live in their own container and stop propagation,
+        // so a click on Delete can never be read as "show me details".
         return `
           <div style="padding: 12px; border-bottom: 1px solid #e2e8f0; display:flex; justify-content:space-between; gap:12px; align-items:center;">
-            <div style="display:flex; gap:12px; align-items:flex-start; min-width:0;">
+            <div class="pd-clickable" style="display:flex; gap:12px; align-items:flex-start; min-width:0; flex:1; border-radius:4px; margin:-4px; padding:4px;"
+                 role="button" tabindex="0"
+                 title="Show project details"
+                 onclick="showProjectDetails(${project.project_id})"
+                 onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showProjectDetails(${project.project_id});}">
             ${thumb}
             <div style="min-width:0;">
               <div style="font-weight:600; color:#0f172a; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="Created: ${created}">
@@ -1689,11 +1711,14 @@
                  beside the two most-clicked buttons on the row. It is now
                  first and separated by a divider, so a misclick on the way
                  to Open can't destroy a project. -->
-            <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+            <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;" onclick="event.stopPropagation();">
               <button class="cat-btn cat-btn--outline-danger" style="padding:7px 10px; font-size:12px; white-space:nowrap;" onclick="deleteDbProject(${project.project_id}, '${safeName}')">
                 <svg class="cat-icon"><use href="/vendor/feather/feather-sprite.svg#trash-2"/></svg> Delete
               </button>
               <span aria-hidden="true" style="width:1px; align-self:stretch; background:#e2e8f0; margin:0 2px;"></span>
+              <button class="cat-btn cat-btn--outline" style="padding:7px 10px; font-size:12px; white-space:nowrap;" onclick="showProjectDetails(${project.project_id})" title="Imagery, annotations, access and activity">
+                <svg class="cat-icon"><use href="/vendor/feather/feather-sprite.svg#info"/></svg> Details
+              </button>
               <button class="cat-btn cat-btn--outline" style="padding:7px 10px; font-size:12px; white-space:nowrap;" onclick="editDbProject(${project.project_id})">
                 <svg class="cat-icon"><use href="/vendor/feather/feather-sprite.svg#edit-3"/></svg> Edit
               </button>
@@ -3426,6 +3451,8 @@
   <script src="js/cat-nav.js"></script>
   <script src="js/cat-auth.js"></script>
   <script src="js/cat-thumbnail.js"></script>
+  <script src="/vendor/leaflet/leaflet.js"></script>
+  <script src="js/project-drawer.js"></script>
   <script>
     // This page calls /api/db/projects* directly, which requires auth in
     // Oracle mode — redirect to login rather than let those calls 401 silently.

@@ -1000,6 +1000,39 @@ def list_project_activity(
     return {"success": True, "activity": activity}
 
 
+@router.get("/projects/{project_id}/assets")
+def list_project_assets(
+    project_id: int,
+    _current_user: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """A project's imagery/elevation assets on their own.
+
+    /snapshot already returns these, but it also returns every annotation in
+    the project — fine when opening the annotator, absurd for a details
+    panel that only wants to know which COGs exist and where their tiles
+    live. Separate endpoint so the panel costs one small query.
+    """
+    _ensure_oracle_mode()
+
+    project = fetch_one(
+        "SELECT project_id FROM cat_projects WHERE project_id = :project_id",
+        {"project_id": project_id},
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    rows = fetch_all(
+        "SELECT * FROM cat_project_assets WHERE project_id = :project_id "
+        "ORDER BY created_at ASC",
+        {"project_id": project_id},
+    )
+    return {
+        "success": True,
+        "count": len(rows),
+        "assets": [_normalize_asset_row(r) for r in rows],
+    }
+
+
 @router.post("/projects/{project_id}/assets")
 def add_project_asset(
     project_id: int,
@@ -1385,18 +1418,34 @@ def bulk_create_annotations(
 
 
 @router.get("/projects/{project_id}/annotations/geojson")
-def annotations_geojson(project_id: int, _current_user: Dict[str, Any] = Depends(require_auth)) -> Dict[str, Any]:
+def annotations_geojson(
+    project_id: int,
+    limit: Optional[int] = None,
+    _current_user: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
     _ensure_oracle_mode()
 
+    # `limit` is optional and defaults to "all", which is what the annotation
+    # page needs — it is drawing the project, so a partial set would be a bug
+    # there. The details drawer's preview map passes a cap instead, so opening
+    # a panel on a 5,000-annotation project doesn't pull every geometry CLOB
+    # just to sketch an outline.
+    params: Dict[str, Any] = {"project_id": project_id}
+    limit_sql = ""
+    if limit is not None:
+        params["limit"] = max(1, min(int(limit), 20000))
+        limit_sql = "FETCH FIRST :limit ROWS ONLY"
+
     rows = fetch_all(
-        """
+        f"""
         SELECT a.*, creator.display_name AS creator_display_name, creator.username AS creator_username
         FROM cat_annotations a
         LEFT JOIN cat_users creator ON creator.user_id = a.created_by_user_id
         WHERE a.project_id = :project_id AND a.deleted_at IS NULL
         ORDER BY a.created_at ASC
+        {limit_sql}
         """,
-        {"project_id": project_id},
+        params,
     )
 
     features = []
