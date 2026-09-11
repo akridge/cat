@@ -99,6 +99,19 @@ def _render_png(url: str, size: int) -> bytes:
         with Reader(gdal_path(url)) as src:
             band_count = len(src.dataset.indexes)
 
+            # preview() reads the smallest overview that satisfies max_size,
+            # which is what keeps a 600 MB DEM to a sub-second render. A source
+            # with no overview pyramid forces a decimated read of every block
+            # instead — still correct, but seconds-to-minutes on a large file.
+            # Worth saying out loud, since the fix is to run the COG converter
+            # over it rather than anything in this endpoint.
+            if not src.dataset.overviews(1):
+                logger.warning(
+                    "Thumbnail source has no overviews, render will be slow: %s "
+                    "(%s x %s) — convert it to a proper COG",
+                    url, src.dataset.width, src.dataset.height,
+                )
+
             # The band count decides how to render, not the filename: a
             # colormap needs exactly one band, so deciding from a name would
             # fail on a 3-band file that happens to have "dem" in it and
@@ -117,7 +130,7 @@ def _render_png(url: str, size: int) -> bytes:
                 # outlier pixels can't flatten the whole image to one colour.
                 from rio_tiler.colormap import cmap
 
-                low, high = _percentile(image, 2), _percentile(image, 98)
+                low, high = _percentile_range(image, 2, 98)
                 if high <= low:
                     high = low + 1.0
                 image.rescale(in_range=((low, high),))
@@ -128,20 +141,34 @@ def _render_png(url: str, size: int) -> bytes:
             return image.render(img_format="PNG", add_mask=True)
 
 
-def _percentile(image, pct: float) -> float:
+def _percentile_range(image, low_pct: float, high_pct: float):
+    """Percentile bounds over an ImageData's VALID pixels only.
+
+    Reads through ImageData.array, which is a numpy MaskedArray, so
+    .compressed() drops nodata exactly. Do not reach for ImageData.mask
+    here: in rio-tiler 9 it is a float32 array (±3.4e38), not a boolean, so
+    `mask.astype(bool)` is true for every pixel including nodata. That bug
+    made a real survey DEM (nodata -32767, seabed -7..-2 m) stretch across
+    -32767..-3, i.e. render as one flat colour -- and it was invisible
+    against synthetic test data that declares a nodata value but contains
+    no nodata pixels.
+
+    Both bounds come from one pass, since compressing a preview twice to
+    compute two percentiles is pure waste.
+    """
     import numpy as np
 
-    data = image.data
-    mask = getattr(image, "mask", None)
-    if mask is not None:
-        valid = data[..., mask.astype(bool)] if mask.ndim == 2 else data[mask.astype(bool)]
+    arr = getattr(image, "array", None)
+    if isinstance(arr, np.ma.MaskedArray):
+        valid = arr.compressed()
     else:
-        valid = data
-    valid = np.asarray(valid).ravel()
+        valid = np.asarray(image.data).ravel()
+
     valid = valid[np.isfinite(valid)]
     if valid.size == 0:
-        return 0.0
-    return float(np.percentile(valid, pct))
+        return 0.0, 1.0
+    lo, hi = np.percentile(valid, [low_pct, high_pct])
+    return float(lo), float(hi)
 
 
 def render_cached_thumbnail(url: str, size: int, refresh: bool = False) -> Path:
