@@ -50,13 +50,22 @@
       </div>
       <div>Username: <strong id="usernameText"></strong> &middot; Email: <strong id="emailText"></strong></div>
 
+      <!-- "Preferred basemap" used to sit here as a free-text field. Nothing
+           in the app read it, and the annotation map deliberately has no
+           basemap (it renders orthomosaic COGs, and external tile hosts are
+           not reachable on the networks this runs on), so the setting could
+           never mean anything. Removed rather than left as decoration.
+           The two below now genuinely pre-fill the annotation form — see
+           seedDefaultsFromAccount() in js/v2-defaults.js. -->
       <h2 style="margin-top: var(--cat-space-4);">Default annotation settings</h2>
+      <p style="margin: 0 0 var(--cat-space-3); color: var(--cat-ink-soft); font-size: 13px;">
+        Used to pre-fill new annotations. Leave blank for none; setting defaults
+        from the annotation panel's Defaults bar overrides these for that browser.
+      </p>
       <label for="defaultSpecies">Default species code</label>
-      <input type="text" id="defaultSpecies">
+      <input type="text" id="defaultSpecies" placeholder="e.g. PLOB">
       <label for="defaultMorphology">Default morphology code</label>
-      <input type="text" id="defaultMorphology">
-      <label for="defaultBasemap">Preferred basemap</label>
-      <input type="text" id="defaultBasemap" placeholder="e.g. satellite, streets">
+      <input type="text" id="defaultMorphology" placeholder="e.g. EN">
 
       <button type="button" class="cat-btn cat-btn--primary save-btn" id="saveProfileBtn">Save Preferences</button>
       <div class="status-msg" id="profileStatus"></div>
@@ -97,15 +106,13 @@
         var prefs = (data && data.preferences) || {};
         document.getElementById('defaultSpecies').value = prefs.default_species || '';
         document.getElementById('defaultMorphology').value = prefs.default_morphology || '';
-        document.getElementById('defaultBasemap').value = prefs.default_basemap || '';
       });
     });
 
     document.getElementById('saveProfileBtn').addEventListener('click', function () {
       var preferences = {
         default_species: document.getElementById('defaultSpecies').value,
-        default_morphology: document.getElementById('defaultMorphology').value,
-        default_basemap: document.getElementById('defaultBasemap').value
+        default_morphology: document.getElementById('defaultMorphology').value
       };
       fetch('/api/auth/preferences', {
         method: 'PUT',

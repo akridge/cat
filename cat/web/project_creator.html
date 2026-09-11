@@ -5,6 +5,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="initial-scale=1.0">
   <link rel="stylesheet" href="css/cat-theme.css" />
+  <link rel="stylesheet" href="css/cat-thumbnail.css" />
   <style>
     * {
       box-sizing: border-box;
@@ -1241,10 +1242,30 @@
             </div>`
           : '';
 
+        // Preview the site's actual imagery. Prefers the orthomosaic and
+        // falls back to the DEM so an elevation-only site still shows
+        // something; a site with neither (or whose COG can't be read) keeps
+        // the placeholder and stays the same size as its neighbours.
+        const previewUri = site.cog_uri || site.dem_uri || null;
+        const siteThumb = (typeof catThumbnailHtml === 'function')
+          ? catThumbnailHtml({
+              cogUrl: previewUri,
+              size: 72,
+              alt: previewUri ? `Imagery for ${site.site_name}` : '',
+              label: site.has_cog ? 'Preview' : 'No COG',
+              badge: (!site.cog_uri && site.dem_uri) ? 'DEM' : ''
+            })
+          : '';
+
         card.innerHTML = `
-          <div class="site-card-name">${site.site_name}</div>
-          <div class="site-card-meta">Region: <strong>${site.region || '—'}</strong></div>
-          <div style="margin:6px 0;">${depthBadge}${cogBadge}${demBadge}</div>
+          <div style="display:flex; gap:10px; align-items:flex-start;">
+            ${siteThumb}
+            <div style="min-width:0; flex:1;">
+              <div class="site-card-name">${site.site_name}</div>
+              <div class="site-card-meta">Region: <strong>${site.region || '—'}</strong></div>
+              <div style="margin:6px 0;">${depthBadge}${cogBadge}${demBadge}</div>
+            </div>
+          </div>
           ${cogSnip}
           ${visitStrip}
           <div class="site-card-actions">
@@ -1546,22 +1567,56 @@
         // owner, the actual account that created the project — show both
         // when they diverge.
         const owner = project.owner_display_name || project.owner_username || null;
-        const ownerLine = !owner ? ' • Owner: unassigned' : (owner !== observer ? ` • Owner: ${owner}` : '');
         const safeName = (project.project_name || '').replace(/'/g, "&#39;");
+
+        // Only state what's actually known. The old template always printed
+        // "Observer: -" and "Owner: unassigned", so every row carried two
+        // lines of placeholder noise that read as missing data rather than
+        // as data that simply isn't recorded for this kind of project.
+        const metaBits = [];
+        if (project.site) metaBits.push(`Site: ${site}`);
+        if (project.observer) metaBits.push(`Observer: ${observer}`);
+        if (owner && owner !== project.observer) metaBits.push(`Owner: ${owner}`);
+        const metaLine = metaBits.length
+          ? `<div style="font-size:12px; color:#475569; margin-top:3px;">${metaBits.join(' • ')}</div>`
+          : '';
+
+        // The imagery is what tells two projects apart at a glance; a
+        // failed/absent render leaves the placeholder in place (see
+        // js/cat-thumbnail.js), so a project with no COG yet still lays out
+        // identically.
+        const thumb = (typeof catThumbnailHtml === 'function')
+          ? catThumbnailHtml({
+              projectId: project.project_id,
+              size: 76,
+              alt: `Imagery for ${project.project_name || 'project ' + project.project_id}`,
+              label: 'No imagery'
+            })
+          : '';
+
         return `
           <div style="padding: 12px; border-bottom: 1px solid #e2e8f0; display:flex; justify-content:space-between; gap:12px; align-items:center;">
+            <div style="display:flex; gap:12px; align-items:center; min-width:0;">
+            ${thumb}
             <div style="min-width:0;">
               <div style="font-weight:600; color:#0f172a; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
                 #${project.project_id} • ${project.project_name || 'Untitled'}
               </div>
-              <div style="font-size:12px; color:#475569; margin-top:3px;">
-                Site: ${site} • Observer: ${observer}${ownerLine}
-              </div>
+              ${metaLine}
               <div style="font-size:11px; color:#64748b; margin-top:2px;">
                 Created: ${created}
               </div>
             </div>
+            </div>
+            <!-- Delete used to sit between Report and Open, i.e. directly
+                 beside the two most-clicked buttons on the row. It is now
+                 first and separated by a divider, so a misclick on the way
+                 to Open can't destroy a project. -->
             <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+              <button class="cat-btn cat-btn--outline-danger" style="padding:7px 10px; font-size:12px; white-space:nowrap;" onclick="deleteDbProject(${project.project_id}, '${safeName}')">
+                <svg class="cat-icon"><use href="/vendor/feather/feather-sprite.svg#trash-2"/></svg> Delete
+              </button>
+              <span aria-hidden="true" style="width:1px; align-self:stretch; background:#e2e8f0; margin:0 2px;"></span>
               <button class="cat-btn cat-btn--outline" style="padding:7px 10px; font-size:12px; white-space:nowrap;" onclick="editDbProject(${project.project_id})">
                 <svg class="cat-icon"><use href="/vendor/feather/feather-sprite.svg#edit-3"/></svg> Edit
               </button>
@@ -1573,9 +1628,6 @@
               </button>
               <button class="cat-btn cat-btn--outline" style="padding:7px 10px; font-size:12px; white-space:nowrap;" onclick="window.open('/report?project_id=${project.project_id}', '_blank')">
                 <svg class="cat-icon"><use href="/vendor/feather/feather-sprite.svg#bar-chart-2"/></svg> Report
-              </button>
-              <button class="cat-btn cat-btn--outline-danger" style="padding:7px 10px; font-size:12px; white-space:nowrap;" onclick="deleteDbProject(${project.project_id}, '${safeName}')">
-                <svg class="cat-icon"><use href="/vendor/feather/feather-sprite.svg#trash-2"/></svg> Delete
               </button>
               <button class="cat-btn cat-btn--primary" style="padding:7px 12px; font-size:12px; white-space:nowrap;" onclick="openDbProject(${project.project_id})">
                 <svg class="cat-icon"><use href="/vendor/feather/feather-sprite.svg#external-link"/></svg> Open
@@ -2446,7 +2498,10 @@
       try {
         showStatus('createStatus', 'info', '📦 Analyzing shapefile...');
         
-        const response = await fetch('http://localhost:8000/api/annotations/import/preview-components', {
+        // Same-origin, like every other fetch on this page: a hardcoded
+        // localhost:8000 broke shapefile import behind a proxy or on any
+        // non-default port (Cloud Workstations, Docker port mapping, …).
+        const response = await fetch('/api/annotations/import/preview-components', {
           method: 'POST',
           body: formData
         });
@@ -2882,7 +2937,7 @@
       try {
         showStatus('createStatus', 'info', '🔄 Converting shapefile to annotations...');
         
-        const response = await fetch('http://localhost:8000/api/annotations/import/execute-components', {
+        const response = await fetch('/api/annotations/import/execute-components', {
           method: 'POST',
           body: formData
         });
@@ -3235,9 +3290,12 @@
             </div>
           </button>
 
-          <div style="margin-top: 14px; font-size: 12px; color: #64748b;">
-            Need legacy viewer? <a href="/annotation_file_mode_REFACTORED.html" style="color:#2563eb; text-decoration:none;">Open deprecated viewer</a>
-          </div>
+          <!-- A "Need legacy viewer?" link used to sit here pointing at
+               /annotation_file_mode_REFACTORED.html. server.py has never
+               routed that path, so it was a guaranteed 404; the page itself
+               lives in web/deprecated/ as archived source. Removed rather
+               than repointed — the deprecated viewers are kept for reference,
+               not for use. -->
 
           <button onclick="this.closest('[style*=fixed]').remove()" style="
             margin-top: 18px;
@@ -3290,6 +3348,7 @@
   </script>
   <script src="js/cat-nav.js"></script>
   <script src="js/cat-auth.js"></script>
+  <script src="js/cat-thumbnail.js"></script>
   <script>
     // This page calls /api/db/projects* directly, which requires auth in
     // Oracle mode — redirect to login rather than let those calls 401 silently.
