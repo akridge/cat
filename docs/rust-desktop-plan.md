@@ -1,169 +1,186 @@
 # CAT Desktop (Rust) — Plan
 
-Status: proposal · Scope: a desktop build of the **database (Oracle) version** of CAT, written in Rust, with the database and AI services remaining remote.
+Status: proposal (rev 2) · Scope: a **portable Windows** desktop app for the **database (Oracle) version** of CAT, written in Rust. Oracle and the AI service stay remote behind the CAT server.
+
+## Requirements (confirmed)
+
+| | |
+|---|---|
+| Platform | **Windows only** (10/11, x64) |
+| Distribution | **Portable** — runs from a folder or USB stick, no installer, no admin rights, no Python |
+| Database | **Oracle, long term**; will later point at the **production** database. Desktop never talks to Oracle directly |
+| Connectivity | Users are **online**; the CAT server is reachable over HTTPS |
+| Imagery | All COGs are in an **open (public) GCS bucket** |
+| GDAL | **Not required** on the client — annotation only needs to *display* COGs |
+| UI | Native annotation is desirable if feasible |
 
 ## TL;DR
 
-- **Yes, it's possible**, and the current codebase is well shaped for it.
-- Use **Tauri 2** (Rust core + the OS webview). Keep the existing ~31k lines of Leaflet/JS UI; rewrite the *backend* parts that run on the user's machine (tiles, COG conversion, exports, file projects, offline cache) in Rust.
-- The database **stays remote behind an HTTPS API** — the desktop app should **not** open a direct Oracle connection.
-- SAM3 segmentation stays a remote GPU service; the desktop calls it over HTTP.
-- Do it as a strangler migration: a working desktop app in the first phase, more Rust each phase, never a big-bang rewrite.
+- **Rust core, no GDAL, no Python.** The app reads COGs straight from the public bucket with HTTP range requests and draws tiles itself in pure Rust.
+- **The CAT server stays the gateway to Oracle.** Pointing at prod later is a server config change; the desktop only stores a server URL and a login token.
+- **Two-stage UI:**
+  - **Stage 1:** a Tauri portable `.exe` that reuses the existing web annotation UI. It ships in weeks, not months.
+  - **Stage 2:** a native Rust annotation workstation (egui + GPU), built on the same Rust crates, which replaces the webview annotation screen once it reaches feature parity.
+- Things that need GDAL or heavy compute (FileGDB/GPKG export, COG conversion, hillshade/slope, SAM3) stay on the server, which already has endpoints for them.
 
-## What CAT is today (relevant facts)
-
-| Piece | Today | Size |
-|---|---|---|
-| Web UI | Static HTML + vanilla JS + Leaflet/Leaflet.draw, served by FastAPI | ~31.7k JS, ~8.6k HTML |
-| API | FastAPI, ~140 routes (`cat/server.py`, `cat/api/*`) | ~13k Python |
-| DB layer | Oracle via `oracledb`; geometry stored as GeoJSON in CLOBs (no SDO_GEOMETRY) | `cat/db/*`, `db_projects.py` (5k) |
-| Tiles | TiTiler/rio-tiler over local or `gs://` COGs, LOCAL_CS → EPSG:4326 VRT override | `server.py` |
-| Raster tools | hillshade, slope, zonal stats, thumbnails | `raster_tools.py`, `thumbnails.py` |
-| Exports | GeoJSON, CSV, Shapefile, GeoPackage, KML, FileGDB | `exports.py`, `db_projects.py` |
-| Auth | Cookie session (`cat_session`), bcrypt, sessions table | `cat/api/auth.py`, `cat/db/auth.py` |
-| AI | SAM3 sidecar (torch/CUDA), HTTP | `services/sam3-service` |
-
-Things that make this easier:
-
-1. **The UI calls the API with relative, same-origin URLs** (`fetch('/api/...')`, `catFetch`). If the desktop app serves the UI from a local origin and answers `/api/*` there, the JS barely changes.
-2. **Annotations already carry a `client_uuid`** (unique index in Oracle) and the UI already uses `/annotations/batch-sync` with retry logic. That is the foundation of offline sync.
-3. Geometry is plain GeoJSON text, not Oracle spatial types, so a local SQLite cache can mirror it exactly.
-
-## Target architecture
+## Architecture
 
 ```
-┌──────────────────────── CAT Desktop (Tauri 2) ────────────────────────┐
-│  Webview: existing cat/web UI (Leaflet, annotation runtime, QC, etc.) │
-│        │  same-origin http://127.0.0.1:<random>/...                   │
-│  ┌─────▼──────────── embedded Rust server (axum) ─────────────────┐   │
-│  │ /tiles, /info, /bounds, /statistics  → local tile engine (GDAL)│   │
-│  │ /api/raster-tools/*, thumbnails      → local (GDAL/Rust)       │   │
-│  │ /api/convert, file-mode projects     → local                   │   │
-│  │ /api/exports (shp/gpkg/kml/gdb)      → local (GDAL)            │   │
-│  │ /api/db/*, /api/auth/*, species, sites → proxy to remote API,  │   │
-│  │                                         inject bearer token,   │   │
-│  │                                         write-through cache    │   │
-│  │ /api/segmentation/*                  → proxy to SAM3 service   │   │
-│  └────────┬────────────────────────────────────────┬──────────────┘   │
-│     SQLite cache + outbox (offline)          OS keychain (token)      │
-└───────────┼────────────────────────────────────────┼──────────────────┘
-            │ HTTPS                                  │
-   ┌────────▼─────────┐   ┌──────────────┐   ┌──────▼───────────┐
-   │ CAT API server    │──▶│ Oracle DB    │   │ SAM3 GPU service │
-   │ (FastAPI today,   │   └──────────────┘   └──────────────────┘
-   │  optional Rust    │   COGs: local disk, or GCS via range reads
-   │  later)           │
-   └───────────────────┘
+┌──────────── CAT.exe (portable folder) ─────────────────────────────┐
+│  UI  ── Stage 1: WebView2 + existing cat/web (Leaflet)             │
+│      ── Stage 2: native egui annotation canvas (wgpu)              │
+│                                                                    │
+│  Rust crates (shared by both stages)                               │
+│   cat-cog    COG reader: HTTP range reads from public GCS,         │
+│              IFD/overview parsing, tile decode (JPEG/ZSTD/LZW/     │
+│              DEFLATE), reprojection → WebMercator, LRU cache       │
+│   cat-api    typed client for the CAT server (/api/db/*, auth,     │
+│              species, sites, field options, segmentation, exports)│
+│   cat-core   Project / Annotation / OverlayLayer models, GeoJSON   │
+│   cat-local  Stage 1 only: loopback axum server that serves        │
+│              cat/web, local /tiles, and proxies /api/* to server   │
+│                                                                    │
+│  data\  settings.toml, tile cache, logs (next to the exe)          │
+│  token → Windows Credential Manager (per user)                     │
+└───────┬─────────────────────────────────────────┬──────────────────┘
+        │ HTTPS (bearer token)                    │ HTTPS range GETs (anonymous)
+┌───────▼──────────────┐                 ┌────────▼────────────────────┐
+│ CAT server (FastAPI) │──▶ Oracle (dev → prod)  │ storage.googleapis.com │
+│ auth, projects,      │──▶ SAM3 GPU service     │ public COG bucket      │
+│ annotations, exports │                 └─────────────────────────────┘
+└──────────────────────┘
 ```
 
 ### Key decisions
 
-**1. Tauri 2, not a pure-Rust GUI (egui/iced/Slint).**
-A native Rust UI means rewriting the map, drawing/editing tools, snapping, lasso, undo, QC tables, compare, reports — essentially all 31k lines of JS — and Rust has no Leaflet/OpenLayers equivalent of that maturity. Tauri gives a native installer, small binary (vs Electron), Rust everywhere off the UI thread, and lets the UI be replaced screen-by-screen later if ever wanted.
+**1. No GDAL — a pure-Rust COG reader (`cat-cog`).**
+Displaying a COG only needs these steps:
+1. Read the TIFF header and IFDs, which hold the tile offsets per overview level.
+2. Fetch the needed internal tiles with HTTP `Range` requests from `https://storage.googleapis.com/<bucket>/<path>`. The bucket is public, so no credentials are needed.
+3. Decode the tiles.
+4. Resample them into 256×256 WebMercator tiles.
 
-**2. Embedded loopback HTTP server rather than only Tauri `invoke` commands.**
-Because the UI uses relative URLs and Leaflet loads tiles by URL, an axum server bound to `127.0.0.1:<random port>` lets the existing JS run unchanged. Lock it down: loopback only, random port, a per-launch secret (cookie or header) required on every request, and strict `Host`/`Origin` checks so other local web pages can't call it. Tauri `invoke` can still be used for desktop-only things (file dialogs, open folder, updater).
+Building blocks:
+- `async-tiff` (Development Seed's COG reader) or `tiff` for parsing.
+- `reqwest` with rustls and HTTP/2 to fetch byte ranges, merging adjacent ranges.
+- Decoders: `zune-jpeg` (JPEG), `zstd` (statically linked C, fine for a portable exe) or pure-Rust `ruzstd`, `weezl` (LZW), `miniz_oxide` (DEFLATE), plus the TIFF horizontal predictor. These cover every profile `make_cog.py` produces: zstd for RGB, LZW otherwise, optional JPEG/deflate.
+- `proj4rs` (pure Rust) for UTM/geographic → WebMercator. LOCAL_CS rasters get the same "treat as EPSG:4326" override the server applies today.
+- `moka` in-memory LRU, plus an optional on-disk tile cache in `data\cache`.
+- `image` / `png` / `webp` to encode tiles for the webview in Stage 1. Stage 2 uploads raw RGBA straight to the GPU.
 
-**3. Database stays remote behind an API — no direct Oracle from desktops.**
-Direct Oracle would mean shipping Oracle Instant Client (ODPI-C, needed by the Rust `oracle` crate) to every machine, putting DB credentials on laptops, opening port 1521 through firewalls, and losing the server-side permission checks (collaborators, admin). Instead the desktop is a client of the CAT API:
-- **Near term:** keep the existing FastAPI server for `/api/db/*`, auth, species, sites. It already exists and works.
-- **Server change needed:** add bearer-token auth alongside the cookie (e.g. `POST /api/auth/token` returning a session token; `Authorization: Bearer` accepted wherever the cookie is). Store the token in the OS keychain (`keyring` crate). Require HTTPS.
-- **Optional later:** rewrite the server in Rust (axum). Note the Oracle constraint: `sqlx` has no Oracle driver, so a Rust server would use the `oracle` crate (server-side Instant Client is fine) — or this becomes the moment to move to PostgreSQL/PostGIS, which `sqlx` supports well. Not required for the desktop app.
+Benefits: tiles no longer go through the server, so server load drops, and a 10–20 MB exe has no native DLL chain to ship.
 
-**4. Tiles rendered locally in Rust via GDAL.**
-This is the main reason a desktop app is worth it: field users with local orthomosaics get tiles straight from disk with no server round-trip.
-- Use the `gdal` crate (COG reads, overviews, warping to WebMercator, `/vsigs/` + `/vsicurl/` for GCS, VRT for the LOCAL_CS override — same tricks `server.py` uses today) and encode PNG/JPEG/WebP with the `image` crate.
-- Keep TiTiler-compatible URL shapes (`/tiles/WebMercatorQuad/{z}/{x}/{y}?url=...`, `/info`, `/bounds`, `/statistics`) so the JS doesn't change.
-- In-memory LRU tile cache (`moka`) + open-dataset pool per thread (GDAL handles aren't `Sync`; use a `spawn_blocking` pool of per-thread datasets).
-- Pure-Rust alternative to watch: `async-tiff` / `geotiff` crates. Smaller to ship, but reprojection, overview selection and resampling would need to be written; revisit after the spike.
+**2. Oracle stays behind the server — including prod.**
+The desktop gets no Oracle client, no database credentials and no port 1521. Moving to the prod database later is a server-side change (DSN and credentials in the server's env). The desktop just picks a server profile, for example `Dev` and `Prod` entries in `settings.toml`.
 
-**5. SAM3 stays remote.** torch + CUDA doesn't belong in a desktop installer. The desktop proxies `/api/segmentation/*` to a configured service URL (or the CAT server forwards it). A later option is a small local model via `ort` (ONNX Runtime) for CPU-only point prompts.
+Server changes needed:
+- A bearer-token login, e.g. `POST /api/auth/token` → session token, with `Authorization: Bearer` accepted wherever the `cat_session` cookie is today. This reuses the existing `cat_sessions` table.
+- HTTPS everywhere; tighten CORS (no `*` with credentials).
+- An `/api/version` handshake so the desktop can warn when the client and server versions are incompatible. The endpoint already exists; extend it with an API version.
 
-**6. Offline-first annotation editing (phase 3).**
-SQLite (`rusqlite` or `sqlx`) mirrors the tables the annotation screen needs: projects, assets, annotations, overlay layers/features, species, field options, sites. Writes go to the local DB and an **outbox**; a background task drains the outbox with `/annotations/batch-sync`, keyed by `client_uuid` so retries are idempotent. Conflicts: last-write-wins per annotation with history preserved server-side (the history table already exists); show a conflict badge when the server copy changed since the local base version.
+A Rust rewrite of the server isn't needed. If it happens later, it would use the `oracle` crate server-side, since `sqlx` has no Oracle support.
 
-## Rust crates (initial picks)
+**3. Portable Windows packaging.**
+- Ship as a **zip of a folder**:
+  - `CAT.exe`
+  - `data\` with settings, cache and logs
+  - optionally `WebView2\` (Stage 1 only, see below)
 
-| Need | Crate |
+  No installer, no registry writes, no admin rights.
+- **WebView2 (Stage 1):** the Evergreen runtime comes preinstalled on Windows 10/11, which is enough for most machines. For locked-down machines, Tauri's "fixed version" mode can load a WebView2 runtime shipped inside the folder (≈150–200 MB).
+- **Stage 2 is fully self-contained:** egui/wgpu draws with DirectX 12, falling back to Vulkan or GL, so the exe is about 15–25 MB with nothing else to install.
+- **Updates:** the app checks the server for a newer version, downloads `CAT.exe.new` and swaps it on restart. That works without installers or admin rights.
+- **Code-sign** `CAT.exe` (Authenticode) so SmartScreen and endpoint protection don't block it. This is critical in government environments.
+- Statically link the MSVC runtime (`+crt-static`) so no VC++ redistributable is needed.
+
+**4. Online-first, with a small safety net.**
+Users are online, so a full offline/sync engine is out of scope. Keep a local **outbox**: unsent saves are written to `data\outbox.sqlite` and retried with the existing `/annotations/batch-sync` and `client_uuid` idempotency. A dropped Wi-Fi connection or a server restart then never loses work. The existing JS autosave already does this in memory; this makes it survive an app crash.
+
+**5. What stays server-side.**
+| Feature | Where | Why |
+|---|---|---|
+| FileGDB / GeoPackage export | server (existing `/projects/export/gdb`, `/gpkg`) | needs GDAL |
+| GeoJSON / CSV / Shapefile / KML export | **desktop** (`geojson`, `csv`, `shapefile`, `kml` crates) | simple, pure Rust, saves round-trips |
+| COG conversion | server / CLI (`make_cog.py`) | COGs are already in the bucket |
+| Hillshade, slope, zonal stats | server for now; pure Rust later if wanted | GDAL today |
+| SAM3 segmentation | server → GPU service | torch/CUDA |
+| Thumbnails | desktop (read the COG's smallest overview) | cheap with `cat-cog` |
+| Admin, user management, reports, QC, activity | server pages, opened in the browser (Stage 2) | infrequent; no need to rebuild natively |
+
+## Stage 1 — Portable Tauri app with the existing UI
+
+The existing UI calls the API with relative, same-origin URLs (`fetch('/api/...')`, `catFetch`) and loads tiles by URL. A loopback axum server inside the exe (`cat-local`) therefore lets that JS run nearly unchanged:
+
+- `/` and static files → `cat/web` embedded in the exe (`include_dir` / `rust-embed`).
+- `/tiles/...`, `/info`, `/bounds`, `/statistics` → `cat-cog`, using **TiTiler-compatible URL shapes** so the JS is untouched.
+- `/api/*` → proxied to the configured CAT server, with the bearer token injected.
+- Security:
+  - bind to `127.0.0.1` on a random port;
+  - require a per-launch secret on every request;
+  - check `Host`/`Origin`;
+  - no CORS.
+
+## Stage 2 — Native annotation workstation (egui)
+
+**Feasibility:** yes. It is the largest piece of work: the web annotation runtime is about 27k lines of JS plus a 1.2k-line page. Most of that is UI glue, though, and the core is a well-defined set of features:
+
+| Area | Native implementation |
 |---|---|
-| App shell, installer, updater | `tauri` 2, `tauri-plugin-updater`, `tauri-plugin-dialog`, `tauri-plugin-shell` |
-| Local HTTP | `axum`, `tower-http` (static files, CORS off), `tokio` |
-| Proxy to remote API | `reqwest` (rustls), `hyper` |
-| Raster / COG / exports | `gdal` (bundled build), `image` |
-| Vector geometry | `geo`, `geojson`, `proj` (or via GDAL) |
-| Local DB / cache | `rusqlite` (bundled) or `sqlx` (sqlite) |
-| Caching | `moka` |
-| Secrets | `keyring` |
-| Config / logging | `serde`, `figment` or `config`, `tracing`, `tracing-appender` |
-| GCS (non-GDAL paths) | `object_store` |
+| Map canvas, pan/zoom (up to the current 2000× deep zoom) | custom egui widget on wgpu; tiles from `cat-cog` uploaded as textures |
+| Annotation rendering (thousands of polygons) | GPU tessellation (`lyon`) — faster than Leaflet SVG/canvas at high counts |
+| Draw point / line / rectangle / polygon, lasso, vertex edit, snapping | `geo` crate for geometry ops and hit-testing; R-tree (`rstar`) for snapping and selection |
+| Undo/redo, history restore | command stack in Rust; server history endpoints |
+| Attribute form, species autocomplete, field options | egui forms; species/field options cached from the server |
+| Overlay layers (shapefile, transects), symbology, layer panel | `cat-api` + `geojson` |
+| Measure, bookmarks, timer/sessions, compare (split view) | native |
+| SAM3 box/point/text prompts | call server, draw returned masks |
+| Keyboard-first workflow (Ctrl+S, hotkeys) | native shortcuts |
+
+Approach: build it inside the same exe as a second window or mode, behind a "Native annotation (beta)" toggle. It reuses `cat-cog`, `cat-api` and `cat-core` unchanged, so the work goes into the UI rather than the plumbing. Once it reaches parity, drop WebView2 and `cat-local`, and open the infrequent pages (admin, reports, QC, activity) in the user's browser on the server.
 
 ## Phased plan
 
-### Phase 0 — Spike (≈2–3 weeks)
-Goal: prove the two risky parts before committing.
-- Tauri app that loads `cat/web` from an embedded axum server.
-- Rust tile endpoint for one local COG and one `gs://` COG, incl. a LOCAL_CS file. Benchmark against TiTiler (p50/p95 tile latency, CPU, memory) on Windows and macOS.
-- Build GDAL into the bundle on **Windows, macOS (arm64 + x64), Linux**. This is the biggest packaging risk; decide here between a bundled/static GDAL build vs. pure-Rust TIFF reading.
-- **Exit criteria:** tiles at least as fast as TiTiler; signed installer < ~150 MB that runs on a clean machine without admin rights or Python.
+| Phase | Duration (1 dev) | Deliverable |
+|---|---|---|
+| **0 — Spike** | 2–3 wk | `cat-cog` renders tiles from a real bucket COG (zstd RGB, LZW DEM, a LOCAL_CS file). Benchmark against TiTiler. Tauri portable exe opens the existing UI against the dev server. **Exit:** tiles at least as fast as TiTiler; the exe runs from a USB stick on a clean, non-admin Windows account |
+| **1 — Portable desktop v1** | 4–6 wk | Token auth on the server, login screen, server profiles (dev/prod), API proxy, local tiles, thumbnails, outbox, self-update, signed zip release |
+| **2 — Local exports & polish** | 2–3 wk | GeoJSON/CSV/SHP/KML export on the desktop; GDB/GPKG via server; native save dialogs; logging and crash reports |
+| **3 — Native annotation (beta)** | 10–16 wk | egui map canvas, draw/edit tools, attribute form, layers, undo, SAM3, compare; side by side with the web UI |
+| **4 — Native by default** | 2–4 wk | Parity sign-off with annotators, WebView2 dependency dropped, admin/report pages open in the browser |
 
-### Phase 1 — Desktop client for the DB version (≈4–6 weeks)
-- Rust proxy for `/api/db/*`, `/api/auth/*`, species, sites, field options, segmentation → remote CAT server.
-- Server: add token auth endpoint + bearer support; enforce HTTPS; tighten CORS (no `*` with credentials).
-- Desktop login screen → token → keychain; "Server URL" setting; sign-out.
-- Local tiles for COGs referenced by project assets (local path or `gs://`).
-- Packaging: MSI/NSIS (Windows), DMG (macOS, notarized), AppImage/deb; auto-update channel; code signing.
-- **Result:** a usable desktop CAT on the Oracle backend, with no Python on the client.
-
-### Phase 2 — Move local work to Rust (≈4–6 weeks)
-- COG conversion (`/api/convert`, batch) via GDAL COG driver with progress events to the UI.
-- Exports: GeoJSON, CSV, Shapefile, GeoPackage, KML, FileGDB (GDAL `OpenFileGDB` writer) — generated on the desktop from API data, saved via native file dialog.
-- Raster tools: hillshade, slope (GDAL DEM processing), zonal stats, thumbnails.
-- Shapefile import / overlay upload parsing locally, then pushed to the API.
-- File-mode (JSON) projects reimplemented in Rust so one app covers both modes.
-
-### Phase 3 — Offline & sync (≈4–8 weeks)
-- SQLite mirror + outbox; "Make available offline" per project (downloads project, annotations, overlay layers, reference data; optionally copies COGs locally).
-- Sync status UI, conflict badges, retry/backoff, background sync when online.
-- Annotation timer/sessions recorded locally and uploaded.
-
-### Phase 4 — Optional
-- Rust rewrite of the remote API server (axum), likely with a PostgreSQL/PostGIS migration.
-- Native Rust replacements for performance-critical UI pieces (e.g. a WebGL/wgpu annotation layer for very large polygon counts).
-- Local CPU segmentation via ONNX.
-
-Estimates assume one experienced developer; Phase 0 results should reset them.
-
-## Risks & mitigations
-
-| Risk | Mitigation |
-|---|---|
-| Bundling GDAL per-OS (esp. Windows) | Solve in Phase 0; use a vendored/static GDAL build in CI; fallback: pure-Rust TIFF reader for tiles, GDAL only for conversion/exports |
-| Webview differences (WebView2 vs WKWebView vs WebKitGTK) | Test Leaflet heavy pages on all three early; Linux WebKitGTK is the slowest — consider it lower priority |
-| Large COGs over GCS from field networks | Local tile cache on disk; "download COG for offline" option; range-merge settings like today's GDAL env |
-| Government IT: code signing, no admin installs, managed endpoints | Per-user installers (NSIS/MSI per-user), signed builds, configurable proxy (`HTTPS_PROXY` honored by `reqwest`) |
-| Oracle API surface is big (`db_projects.py` ~5k lines) | Don't rewrite it for the desktop; proxy it. Only cache what the annotation screen needs |
-| Security of the local server | Loopback-only, random port, per-launch secret, Host/Origin checks, no CORS |
-| Two backends drifting (Python web + Rust desktop) | Keep TiTiler-compatible routes; contract tests that run the same requests against both |
+Phase 0 results should reset these estimates. Phases 1–2 alone give a usable, portable desktop app; Phase 3 is the native upgrade.
 
 ## Proposed repo layout
 
 ```
 desktop/
-  src-tauri/            # Tauri app: windows, updater, menus, invoke commands
+  Cargo.toml                 # workspace
   crates/
-    cat-core/           # models (Project, Annotation, OverlayLayer...), GeoJSON types
-    cat-tiles/          # COG reading, tile rendering, LOCAL_CS handling
-    cat-gis/            # COG conversion, exports, raster tools
-    cat-local-server/   # axum router: local routes + proxy + auth injection
-    cat-sync/           # SQLite cache, outbox, sync engine
-cat/web/                # unchanged; served by both FastAPI and the desktop app
+    cat-core/                # models, GeoJSON types
+    cat-cog/                 # pure-Rust COG reader + tile renderer
+    cat-api/                 # CAT server client (auth, projects, annotations…)
+    cat-local/               # Stage 1 loopback server + proxy
+    cat-native/              # Stage 2 egui annotation UI
+  app/                       # CAT.exe (Tauri in Stage 1; eframe in Stage 2)
+cat/web/                     # unchanged; served by FastAPI and embedded in CAT.exe
 ```
+
+CI: GitHub Actions `windows-latest` builds `CAT.exe` (static CRT), signs it and publishes `CAT-<version>-win64-portable.zip` as a release asset.
+
+## Risks & mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Unsigned portable exe blocked by SmartScreen or agency endpoint protection | Authenticode signing from day one; check the agency's software-approval process early |
+| WebView2 missing or locked down on some machines (Stage 1) | Fixed-version WebView2 in the folder; Stage 2 removes the dependency |
+| COG variants the Rust reader doesn't handle (odd compression, band layout, nodata/alpha, CRS) | Inventory the bucket in Phase 0 (script listing compression/CRS/bands per COG); fall back to server tiles for unsupported files |
+| Tile latency from the public bucket on slow networks | Merged range reads, HTTP/2, prefetch of neighboring tiles, disk cache |
+| Native UI parity takes longer than planned | Ship Stage 1 first; keep the web UI as the fallback until annotators sign off |
+| Dev → prod Oracle cutover | Desktop unaffected (server-side change); server profiles in settings; version handshake |
 
 ## Open questions
 
-1. Who uses the desktop build — field teams on laptops (offline matters → Phase 3 earlier) or office analysts on network (Phase 1 is enough)?
-2. Where do COGs live for desktop users: local disks, GCS, or both?
-3. Is the Oracle backend fixed, or is PostgreSQL/PostGIS an option for the server long term?
-4. Required platforms: Windows only, or macOS/Linux too?
-5. Will the CAT API server be reachable from outside Cloud Workstations (public HTTPS / VPN)? The desktop app needs a stable HTTPS endpoint.
-6. Any agency requirements on code signing, installers, or credential storage?
+1. Is there an agency code-signing certificate available, or does one need to be requested?
+2. Can WebView2 be assumed on target machines (Windows 10/11 with Edge), or must the portable zip carry it?
+3. Should the desktop also open local `.tif` files (not just bucket COGs) for ad-hoc viewing? `cat-cog` can read local files with the same code.
+4. Which features have the highest priority for the native annotation screen (for ordering Phase 3)?
