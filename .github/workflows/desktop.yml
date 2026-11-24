@@ -1,0 +1,71 @@
+name: CAT Desktop (Windows)
+
+on:
+  push:
+    paths:
+      - "desktop/**"
+      - "docs/icon.png"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - name: Unit tests (cat-cog, offline)
+        run: cargo test -p cat-cog --lib --tests
+
+  windows:
+    name: Build portable CAT.exe
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+    env:
+      # Static MSVC runtime: no Visual C++ redistributable needed on user PCs.
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+      - name: Build
+        run: cargo build --release -p cat-desktop --locked
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $name = "CAT-$ver-$sha-win64-portable"
+          New-Item -ItemType Directory -Force -Path "dist/$name/data" | Out-Null
+          Copy-Item target/release/CAT.exe "dist/$name/"
+          Copy-Item README-portable.txt "dist/$name/README.txt"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          "ZIP_NAME=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-Item "dist/$name/CAT.exe" | Select-Object Name, Length
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: desktop/dist/${{ env.ZIP_NAME }}.zip
+          if-no-files-found: error

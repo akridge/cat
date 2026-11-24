@@ -1,0 +1,21 @@
+[package]
+name = "cat-desktop"
+description = "CAT: Coral Annotation Tool - native Windows desktop app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "CAT"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+cat-cog = { path = "../crates/cat-cog" }
+eframe = { version = "0.37", features = ["glow"] }
+egui = "0.37"
+lru = "0.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "query"] }

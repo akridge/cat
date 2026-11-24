@@ -1,0 +1,17 @@
+[package]
+name = "cat-cog"
+description = "Pure-Rust Cloud Optimized GeoTIFF reader and WebMercator tile renderer for CAT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2"] }
+lru = "0.19"
+zstd = "0.14"
+weezl = "0.2"
+miniz_oxide = "0.9"
+png = "0.18"

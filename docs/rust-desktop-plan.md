@@ -16,6 +16,19 @@ Status: proposal (rev 3) · Scope: a **native Rust, portable Windows** annotatio
 | GDAL | **Not needed** on the client |
 | Browser | Chrome is the default browser. Secondary web pages open there |
 
+## Progress
+
+**Phase 0 — under way** (`desktop/`)
+- `cat-cog`: a pure-Rust COG reader. It parses TIFF/BigTIFF and GeoTIFF, merges neighbouring HTTP range reads, decodes ZSTD/LZW/DEFLATE in parallel, and detects the mosaic background colour.
+- `CAT.exe`: a native egui map canvas.
+  - Pan and zoom to 64× past native resolution.
+  - Overviews are chosen by zoom level, with coarse tiles shown underneath while sharp ones load.
+  - Bucket browser, layers with opacity, scale bar, coordinate readout.
+- Windows portable-zip build in GitHub Actions; offline unit tests.
+- **Bucket survey (2026, all 357 files, 454 GB):** every file is RGB 8-bit, ZSTD, 512 px tiles, 6 overview levels and EPSG:4326, at ~0.5 mm/pixel. None has a mask or nodata; the area outside the reef is pure white, with black wedges on rotated exports. All 357 open without errors.
+- **Design change from the survey:** the app draws each COG internal tile as a GPU-textured quad instead of resampling into WebMercator tiles on the CPU. That gives pixel-exact display at any zoom, and UTM support (proj4rs) is deferred until a non-4326 COG appears.
+- **Timings from a cloud container behind a proxy:** headers 0.3–0.6 s; coarse overview 0.15 s; a 1920×1080 view at full resolution (15 tiles) 0.55 s. These still need measuring on agency Windows laptops.
+
 ## TL;DR
 
 - **One small `CAT.exe` (≈15–25 MB), fully native.** It uses egui with a GPU map canvas (wgpu → DirectX 12). No webview, no runtime to install, no DLLs to ship.
