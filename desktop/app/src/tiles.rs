@@ -191,7 +191,8 @@ impl TileManager {
         let still: HashSet<TileKey> = wanted.iter().map(|(k, _)| *k).collect();
         self.pending.retain(|k| still.contains(k));
 
-        let mut batches: HashMap<(u64, u8), (Arc<Cog>, Vec<(u32, u32)>)> = HashMap::new();
+        type Batch = (Arc<Cog>, Vec<(u32, u32)>);
+        let mut batches: HashMap<(u64, u8), Batch> = HashMap::new();
         for (key, cog) in wanted {
             if self.textures.contains(&key) || self.pending.contains(&key) || self.failed.contains_key(&key) {
                 continue;

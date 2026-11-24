@@ -138,8 +138,8 @@ impl Cog {
                 levels.push(lvl);
             }
         }
-        levels.sort_by(|a, b| b.width.cmp(&a.width));
-        masks.sort_by(|a, b| b.width.cmp(&a.width));
+        levels.sort_by_key(|l| std::cmp::Reverse(l.width));
+        masks.sort_by_key(|l| std::cmp::Reverse(l.width));
 
         let first = &ifds[0];
         let geotransform = read_geotransform(first, endian)?;

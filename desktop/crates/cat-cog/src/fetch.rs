@@ -30,6 +30,10 @@ struct Group {
     members: Vec<Want>,
 }
 
+/// Raw bytes per requested tile: (image, mask).
+type Raw = (Option<Vec<u8>>, Option<Vec<u8>>);
+type Slot = Mutex<Option<TileResult>>;
+
 pub type TileResult = ((u32, u32), Result<Option<DecodedTile>>);
 
 impl Cog {
@@ -69,8 +73,6 @@ impl Cog {
             }
         }
 
-        // Raw bytes per requested tile: (image, mask).
-        type Raw = (Option<Vec<u8>>, Option<Vec<u8>>);
         let raws: Vec<Mutex<Result<Raw>>> = (0..tiles.len()).map(|_| Mutex::new(Ok((None, None)))).collect();
         let next = AtomicUsize::new(0);
         std::thread::scope(|s| {
@@ -102,7 +104,7 @@ impl Cog {
         });
 
         // Decode in parallel (zstd + RGBA expansion is CPU-bound).
-        let results: Vec<Mutex<Option<TileResult>>> = (0..tiles.len()).map(|_| Mutex::new(None)).collect();
+        let results: Vec<Slot> = (0..tiles.len()).map(|_| Mutex::new(None)).collect();
         let next = AtomicUsize::new(0);
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(tiles.len().max(1));
         std::thread::scope(|s| {

@@ -33,12 +33,12 @@ impl Default for Camera {
 pub const MAX_OVERZOOM: f64 = 64.0;
 
 impl Camera {
-    pub fn to_screen(&self, rect: Rect, x: f64, y: f64) -> Pos2 {
+    pub fn to_screen(self, rect: Rect, x: f64, y: f64) -> Pos2 {
         let c = rect.center();
         pos2(c.x + ((x - self.cx) / self.mpp) as f32, c.y - ((y - self.cy) / self.mpp) as f32)
     }
 
-    pub fn to_world(&self, rect: Rect, p: Pos2) -> (f64, f64) {
+    pub fn to_world(self, rect: Rect, p: Pos2) -> (f64, f64) {
         let c = rect.center();
         (self.cx + (p.x - c.x) as f64 * self.mpp, self.cy - (p.y - c.y) as f64 * self.mpp)
     }
@@ -90,8 +90,7 @@ pub fn map_ui(ui: &mut egui::Ui, cam: &mut Camera, layers: &[Layer], tiles: &mut
         .filter_map(|l| l.cog())
         .map(|c| c.merc_pixel_size() / MAX_OVERZOOM)
         .fold(f64::INFINITY, f64::min)
-        .min(1.0)
-        .max(1e-7);
+        .clamp(1e-7, 1.0);
 
     // --- Navigation -------------------------------------------------------
     if resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Middle) {
