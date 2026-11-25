@@ -57,7 +57,23 @@ pub struct Settings {
     /// Server project open at exit, reopened on start.
     pub last_project: Option<i64>,
     pub project_scope: String,
+    /// "auto" (DirectX 12 / Vulkan via wgpu) or "opengl". Applied at start.
+    pub renderer: String,
+    /// Smoother but ~1 frame more input lag when false.
+    pub low_latency: bool,
+    pub show_legend: bool,
+    /// Saved map views per mosaic/project key.
+    pub bookmarks: std::collections::BTreeMap<String, Vec<Bookmark>>,
+    /// Remind to take a break after this many minutes of continuous work (0 = off).
+    pub break_minutes: u32,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub name: String,
+    pub view: [f64; 3],
+}
+
 
 impl Default for Settings {
     fn default() -> Self {
@@ -76,6 +92,11 @@ impl Default for Settings {
             server: None,
             last_project: None,
             project_scope: "mine".into(),
+            renderer: "auto".into(),
+            low_latency: true,
+            show_legend: true,
+            bookmarks: Default::default(),
+            break_minutes: 50,
         }
     }
 }

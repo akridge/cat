@@ -70,6 +70,8 @@ struct SyncRound {
     upsert_result: Result<Vec<cat_api::SyncOutcome>, ApiError>,
     deletes: Vec<(String, i64)>,
     delete_result: Result<Vec<i64>, ApiError>,
+    /// Changes left for the next round (batch limits).
+    remaining: usize,
 }
 
 /// Open server project being annotated.
@@ -113,6 +115,8 @@ pub struct Server {
     pub open: Option<OpenProject>,
     pub status: SyncStatus,
     pub last_synced: Option<Instant>,
+    /// Local changes the server doesn't have yet (as of the last round).
+    pub pending: usize,
     /// Set when a sync round finished (the journal should be rewritten).
     pub round_done: bool,
     backoff: u32,
@@ -174,6 +178,7 @@ impl Server {
             open: None,
             status: SyncStatus::Idle,
             last_synced: None,
+            pending: 0,
             round_done: false,
             backoff: 0,
             in_flight: false,
@@ -309,6 +314,7 @@ impl Server {
     fn finish_round(&mut self, r: SyncRound) -> Option<usize> {
         let open = self.open.as_mut().filter(|o| o.project.project_id == r.project_id)?;
         let before = open.sync.conflicts.len();
+        let sent = r.upserts.len() + r.deletes.len();
         let mut error = None;
         match r.upsert_result {
             Ok(outcomes) => open.sync.apply_upserts(&r.upserts, outcomes),
@@ -331,14 +337,19 @@ impl Server {
             None => {
                 self.backoff = 0;
                 self.status = SyncStatus::Idle;
-                self.last_synced = Some(Instant::now());
+                if sent > 0 {
+                    self.last_synced = Some(Instant::now());
+                }
             }
         }
+        self.pending = if matches!(self.status, SyncStatus::Idle) { r.remaining } else { r.remaining + sent };
         let after = self.open.as_ref().map(|o| o.sync.conflicts.len()).unwrap_or(0);
         (after > before).then_some(after)
     }
 
     /// Start a sync round if there is anything to send and nothing in flight.
+    /// Start a sync round unless one is running. Planning (fingerprinting
+    /// every annotation) happens on the worker thread, not the UI thread.
     pub fn maybe_sync(&mut self, items: &[Annotation], analyst: Option<String>) {
         if self.in_flight || self.user.is_none() {
             return;
@@ -353,25 +364,24 @@ impl Server {
             return;
         }
         let created_by = analyst.or_else(|| self.user.as_ref().map(|u| u.name().to_string()));
-        let Plan { mut upserts, mut deletes } = open.sync.plan(items, open.asset_id, created_by.as_deref());
-        if upserts.is_empty() && deletes.is_empty() {
-            if !matches!(self.status, SyncStatus::Offline { .. }) {
-                self.status = SyncStatus::Idle;
-            }
-            return;
-        }
-        upserts.truncate(cat_api::BATCH_MAX);
-        deletes.truncate(500);
-        self.status = SyncStatus::Syncing(upserts.len() + deletes.len());
+        let (items, sync, asset_id) = (items.to_vec(), open.sync.clone(), open.asset_id);
         self.in_flight = true;
         let project_id = open.project.project_id;
         spawn(&self.tx, &self.ctx, move || {
-            let items: Vec<SyncItem> = upserts.iter().map(|u| u.2.clone()).collect();
-            let upsert_result = if items.is_empty() { Ok(Vec::new()) } else { client.batch_sync(project_id, &items) };
+            let Plan { mut upserts, mut deletes } = sync.plan(&items, asset_id, created_by.as_deref());
+            let total = upserts.len() + deletes.len();
+            upserts.truncate(cat_api::BATCH_MAX);
+            deletes.truncate(500);
+            let remaining = total - upserts.len() - deletes.len();
+            let sent: Vec<SyncItem> = upserts.iter().map(|u| u.2.clone()).collect();
+            let upsert_result = if sent.is_empty() { Ok(Vec::new()) } else { client.batch_sync(project_id, &sent) };
             let ids: Vec<i64> = deletes.iter().map(|d| d.1).collect();
             let delete_result = if ids.is_empty() { Ok(Vec::new()) } else { client.batch_delete(project_id, &ids) };
-            Msg::Synced(SyncRound { project_id, upserts, upsert_result, deletes, delete_result })
+            Msg::Synced(SyncRound { project_id, upserts, upsert_result, deletes, delete_result, remaining })
         });
+        if !matches!(self.status, SyncStatus::Offline { .. }) {
+            self.status = SyncStatus::Syncing(self.pending.max(1));
+        }
     }
 
     pub fn retry_now(&mut self) {

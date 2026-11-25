@@ -7,7 +7,7 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::editor::{size_text, size_value, Editor};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Col {
     Num,
     Species,
@@ -23,11 +23,13 @@ pub struct TableState {
     pub filter: String,
     pub incomplete_only: bool,
     last_selected: Option<String>,
+    cache_key: Option<(u64, usize, Col, bool, String, bool)>,
+    cache_rows: Vec<usize>,
 }
 
 impl Default for TableState {
     fn default() -> Self {
-        Self { sort: Col::Num, asc: true, filter: String::new(), incomplete_only: false, last_selected: None }
+        Self { sort: Col::Num, asc: true, filter: String::new(), incomplete_only: false, last_selected: None, cache_key: None, cache_rows: Vec::new() }
     }
 }
 
@@ -48,29 +50,33 @@ pub fn table_ui(ui: &mut egui::Ui, editor: &mut Editor, st: &mut TableState, spe
         ui.checkbox(&mut st.incomplete_only, "Incomplete only");
     });
 
-    let f = st.filter.trim().to_uppercase();
-    let mut rows: Vec<(usize, &Annotation)> = editor
-        .items
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| !st.incomplete_only || !a.is_complete())
-        .filter(|(_, a)| f.is_empty() || a.spcode().contains(&f) || a.text("morph_code").contains(&f))
-        .collect();
-    let key = |a: &Annotation| match st.sort {
-        Col::Species => a.spcode(),
-        Col::Morph => a.text("morph_code"),
-        Col::Kind => a.kind.as_str().to_string(),
-        Col::Done => (a.is_complete() as u8).to_string(),
-        _ => String::new(),
-    };
-    match st.sort {
-        Col::Num => {}
-        Col::Size => rows.sort_by(|a, b| size_value(a.1).total_cmp(&size_value(b.1))),
-        _ => rows.sort_by_key(|r| key(r.1)),
+    // Filtering/sorting every frame was wasted work: redo it only when the
+    // annotations or the table settings change.
+    let key = (editor.rev, editor.items.len(), st.sort, st.asc, st.filter.clone(), st.incomplete_only);
+    if st.cache_key.as_ref() != Some(&key) {
+        let f = st.filter.trim().to_uppercase();
+        let mut idx: Vec<usize> = (0..editor.items.len())
+            .filter(|&i| {
+                let a = &editor.items[i];
+                (!st.incomplete_only || !a.is_complete()) && (f.is_empty() || a.spcode().contains(&f) || a.text("morph_code").contains(&f))
+            })
+            .collect();
+        let items = &editor.items;
+        match st.sort {
+            Col::Num => {}
+            Col::Size => idx.sort_by(|&a, &b| size_value(&items[a]).total_cmp(&size_value(&items[b]))),
+            Col::Species => idx.sort_by_cached_key(|&i| items[i].spcode()),
+            Col::Morph => idx.sort_by_cached_key(|&i| items[i].text("morph_code")),
+            Col::Kind => idx.sort_by_key(|&i| items[i].kind.as_str()),
+            Col::Done => idx.sort_by_key(|&i| items[i].is_complete()),
+        }
+        if !st.asc {
+            idx.reverse();
+        }
+        st.cache_rows = idx;
+        st.cache_key = Some(key);
     }
-    if !st.asc {
-        rows.reverse();
-    }
+    let rows: Vec<(usize, &Annotation)> = st.cache_rows.iter().filter_map(|&i| editor.items.get(i).map(|a| (i, a))).collect();
 
     // Keep the selected row in view when the selection changes on the map.
     let scroll_to = if st.last_selected != editor.selected {

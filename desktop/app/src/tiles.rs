@@ -61,7 +61,9 @@ enum Done {
 const BATCH: usize = 12;
 const WORKERS: usize = 4;
 /// Texture uploads per frame (each 512² tile is 1 MB).
-const UPLOADS_PER_FRAME: usize = 12;
+const UPLOADS_PER_FRAME: usize = 8;
+/// CPU time per frame spent preparing tile textures.
+const UPLOAD_BUDGET: std::time::Duration = std::time::Duration::from_millis(3);
 /// GPU texture cache size in tiles (~1 MB each).
 const TEXTURE_CACHE: usize = 320;
 
@@ -164,15 +166,19 @@ impl TileManager {
                 },
             }
         }
-        // Upload a bounded number of textures per frame.
-        let n = self.ready.len().min(UPLOADS_PER_FRAME);
-        for (key, tile) in self.ready.drain(..n) {
+        // Upload textures within a small time budget per frame so tiles
+        // arriving in bulk never cause a visible hitch while drawing.
+        let start = std::time::Instant::now();
+        let mut uploaded = 0;
+        while uploaded < UPLOADS_PER_FRAME && (uploaded == 0 || start.elapsed() < UPLOAD_BUDGET) {
+            let Some((key, tile)) = (!self.ready.is_empty()).then(|| self.ready.remove(0)) else { break };
             self.pending.remove(&key);
             let tex = tile.map(|t| {
                 let img = egui::ColorImage::from_rgba_unmultiplied([t.w as usize, t.h as usize], &t.rgba);
                 ctx.load_texture(format!("t{}-{}-{}-{}", key.layer, key.level, key.tx, key.ty), img, egui::TextureOptions::LINEAR)
             });
             self.textures.put(key, tex);
+            uploaded += 1;
         }
         if !self.ready.is_empty() {
             ctx.request_repaint();

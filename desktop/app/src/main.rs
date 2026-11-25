@@ -6,6 +6,7 @@ mod editor;
 mod form;
 mod map;
 mod server;
+mod saver;
 mod settings;
 mod table;
 mod tiles;
@@ -32,11 +33,20 @@ fn main() -> eframe::Result {
     if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
+    let saved = Settings::load();
     let renderer = match std::env::var("CAT_RENDERER").as_deref() {
         Ok("glow") => eframe::Renderer::Glow,
-        _ => eframe::Renderer::Wgpu,
+        Ok(_) => eframe::Renderer::Wgpu,
+        Err(_) if saved.renderer == "opengl" => eframe::Renderer::Glow,
+        Err(_) => eframe::Renderer::Wgpu,
     };
-    let options = eframe::NativeOptions { viewport, renderer, ..Default::default() };
+    // Drawing tools need the line to stick to the cursor: queue one frame,
+    // not two (the default favours throughput over input latency).
+    let wgpu_options = eframe::egui_wgpu::WgpuConfiguration {
+        surface: if saved.low_latency { eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY } else { eframe::egui_wgpu::SurfaceConfig::HIGH_THROUGHPUT },
+        ..Default::default()
+    };
+    let options = eframe::NativeOptions { viewport, renderer, wgpu_options, ..Default::default() };
     // Command line: CAT.exe [gs://… or https://… COG URLs] [--zoom N]
     let args: Vec<String> = std::env::args().skip(1).collect();
     let initial: Vec<String> = args.iter().filter(|a| a.contains("://")).cloned().collect();
@@ -54,9 +64,14 @@ fn main() -> eframe::Result {
 
 /// Counts time the user is actively working (input within the last 2 min),
 /// for the session clock and `annotation_time_seconds`.
+type LegendKey = (u64, editor::ColorBy);
+type LegendEntry = (Option<String>, Color32, usize);
+
 struct ActiveTimer {
     last_input: Instant,
     secs: f64,
+    /// Active time since the last real break (5+ minutes idle).
+    since_break: f64,
 }
 
 impl ActiveTimer {
@@ -65,6 +80,9 @@ impl ActiveTimer {
             let gap = self.last_input.elapsed().as_secs_f64();
             if gap < 120.0 {
                 self.secs += gap;
+                self.since_break += gap;
+            } else if gap >= 300.0 {
+                self.since_break = 0.0;
             }
             self.last_input = Instant::now();
         }
@@ -107,6 +125,23 @@ struct CatApp {
     /// Last settings written, to persist only when something changed.
     persisted: String,
     persist_check: Instant,
+    saver: saver::Saver,
+    annotated: std::collections::HashSet<PathBuf>,
+    gfx_info: Option<String>,
+    legend_cache: (LegendKey, Vec<LegendEntry>),
+    /// Camera animation: (from, to, start).
+    fly: Option<(Camera, Camera, Instant)>,
+    bookmark_name: String,
+    /// Cat buddy: snoozed until this much active time; annotations made this session.
+    break_snooze_until: f64,
+    session_created: usize,
+    software_gpu: bool,
+    frame_ms: std::collections::VecDeque<f32>,
+    show_perf: bool,
+    annotated_at: Instant,
+    seen_rev: u64,
+    first_unsaved: Instant,
+    last_title: String,
 
     server: Server,
     login: LoginForm,
@@ -166,13 +201,28 @@ impl CatApp {
             editor,
             form: Form::new(),
             table: table::TableState::default(),
-            timer: ActiveTimer { last_input: Instant::now(), secs: 0.0 },
+            timer: ActiveTimer { last_input: Instant::now(), secs: 0.0, since_break: 0.0 },
             active: None,
             saved_rev: 0,
             last_change: Instant::now(),
             save_state: SaveState::Saved,
             persisted: String::new(),
             persist_check: Instant::now(),
+            saver: saver::Saver::new(ctx.clone()),
+            annotated: Default::default(),
+            gfx_info: None,
+            legend_cache: ((u64::MAX, editor::ColorBy::Status), Vec::new()),
+            fly: None,
+            bookmark_name: String::new(),
+            break_snooze_until: 0.0,
+            session_created: 0,
+            software_gpu: false,
+            frame_ms: Default::default(),
+            show_perf: false,
+            annotated_at: Instant::now() - Duration::from_secs(60),
+            seen_rev: 0,
+            first_unsaved: Instant::now(),
+            last_title: String::new(),
             server: Server::new(ctx),
             login: LoginForm { remember: true, ..Default::default() },
             show_login: false,
@@ -265,44 +315,68 @@ impl CatApp {
         self.active = Some((id, path));
     }
 
+    /// Build the write job for the current annotation set (None = nothing open).
+    fn save_job(&self) -> Option<saver::Job> {
+        if let Some(open) = &self.server.open {
+            // Server project: the journal keeps unsynced work safe on disk.
+            let (path, items, sync) = (open.journal.clone(), self.editor.items.clone(), open.sync.clone());
+            return Some(Box::new(move || server::write_journal(&path, &items, &sync)));
+        }
+        let (id, path) = self.active.clone()?;
+        let uri = self.layers.iter().find(|l| l.id == id).map(|l| l.uri.clone()).unwrap_or_default();
+        let meta = serde_json::json!({"cog": uri, "app": format!("cat-desktop {}", env!("CARGO_PKG_VERSION")), "saved_at": cat_core::annotation::now_iso()});
+        let items = self.editor.items.clone();
+        Some(Box::new(move || store::save_geojson(&path, &items, meta)))
+    }
+
+    /// Save immediately on this thread (project switches, Ctrl+S, exit).
     fn save_now(&mut self) {
         if self.editor.rev == self.saved_rev {
             return;
         }
-        if let Some(open) = &self.server.open {
-            // Server project: the journal keeps unsynced work safe on disk.
-            match server::write_journal(&open.journal, &self.editor.items, &open.sync) {
+        if let Some(job) = self.save_job() {
+            match job() {
                 Ok(()) => {
                     self.saved_rev = self.editor.rev;
                     self.save_state = SaveState::Saved;
                 }
                 Err(e) => self.save_state = SaveState::Failed(e.to_string()),
             }
-            return;
-        }
-        let Some((id, path)) = self.active.clone() else { return };
-        let uri = self.layers.iter().find(|l| l.id == id).map(|l| l.uri.clone()).unwrap_or_default();
-        let meta = serde_json::json!({"cog": uri, "app": format!("cat-desktop {}", env!("CARGO_PKG_VERSION")), "saved_at": cat_core::annotation::now_iso()});
-        match store::save_geojson(&path, &self.editor.items, meta) {
-            Ok(()) => {
-                self.saved_rev = self.editor.rev;
-                self.save_state = SaveState::Saved;
-            }
-            Err(e) => self.save_state = SaveState::Failed(e.to_string()),
         }
     }
 
+    /// Save in the background ~1 s after the last change (at most every 10 s
+    /// while changes keep coming), never blocking drawing.
     fn autosave(&mut self) {
-        if self.editor.rev != self.saved_rev {
-            if self.save_state == SaveState::Saved {
-                self.last_change = Instant::now();
+        for (rev, r) in self.saver.poll() {
+            match r {
+                Ok(()) => {
+                    self.saved_rev = self.saved_rev.max(rev);
+                    if self.saved_rev == self.editor.rev {
+                        self.save_state = SaveState::Saved;
+                    }
+                }
+                Err(e) => self.save_state = SaveState::Failed(e),
             }
-            if !matches!(self.save_state, SaveState::Failed(_)) {
-                self.save_state = SaveState::Pending;
+        }
+        if self.editor.rev != self.seen_rev {
+            if self.editor.rev != self.saved_rev && self.seen_rev == self.saved_rev {
+                self.first_unsaved = Instant::now();
             }
-            // Save shortly after the last change, and never wait more than 10 s.
-            if self.last_change.elapsed() > Duration::from_millis(800) && !self.editor.is_drawing() {
-                self.save_now();
+            self.seen_rev = self.editor.rev;
+            self.last_change = Instant::now();
+        }
+        if self.editor.rev == self.saved_rev || self.saver.submitted == self.editor.rev {
+            return;
+        }
+        if !matches!(self.save_state, SaveState::Failed(_)) {
+            self.save_state = SaveState::Pending;
+        }
+        let quiet = self.last_change.elapsed() > Duration::from_millis(1000) && !self.editor.is_drawing();
+        let overdue = self.first_unsaved.elapsed() > Duration::from_secs(10);
+        if quiet || overdue {
+            if let Some(job) = self.save_job() {
+                self.saver.submit(self.editor.rev, job);
             }
         }
     }
@@ -430,20 +504,23 @@ impl CatApp {
     }
 
     /// Kick off a sync round when local work differs from the server.
+    /// Kick off a sync round when local work may differ from the server.
     fn drive_sync(&mut self) {
-        let Some(open) = &self.server.open else { return };
-        if self.editor.rev != self.sync_rev {
-            self.pending_sync = open.sync.pending(&self.editor.items);
+        if self.server.open.is_none() {
+            return;
         }
         let quiet = self.last_change.elapsed() > Duration::from_millis(700) && !self.editor.is_drawing();
         let retry_due = matches!(&self.server.status, SyncStatus::Offline { retry_at, .. } if Instant::now() >= *retry_at);
-        if (quiet && self.editor.rev != self.sync_rev) || retry_due || (self.pending_sync > 0 && self.server.status == SyncStatus::Idle && quiet) {
+        let more = self.server.pending > 0 && self.server.status == SyncStatus::Idle;
+        if (quiet && self.editor.rev != self.sync_rev) || retry_due || (quiet && more) {
             self.sync_rev = self.editor.rev;
             let analyst = self.settings.sticky.get("analyst").and_then(|v| v.as_str()).map(str::to_string);
             self.server.maybe_sync(&self.editor.items, analyst);
-            if let Some(open) = &self.server.open {
-                self.pending_sync = open.sync.pending(&self.editor.items);
-            }
+        }
+        if self.editor.rev != self.sync_rev && self.server.status == SyncStatus::Idle {
+            self.pending_sync = self.server.pending.max(1);
+        } else {
+            self.pending_sync = self.server.pending;
         }
     }
 
@@ -476,12 +553,86 @@ impl CatApp {
         let (x1, y1) = cat_cog::geo::lonlat_to_merc(b[2], b[3]);
         let mb = cat_cog::MercBox { min_x: x0, min_y: y0, max_x: x1, max_y: y1 };
         let (cx, cy) = mb.center();
-        self.cam.cx = cx;
-        self.cam.cy = cy;
         let need = (mb.width() / (self.map_rect.width() as f64 * 0.5)).max(mb.height() / (self.map_rect.height() as f64 * 0.5));
-        if need > self.cam.mpp {
-            self.cam.mpp = need;
+        let target = Camera { cx, cy, mpp: self.cam.mpp.max(need) };
+        self.fly_to(target);
+    }
+
+    /// Smoothly move the camera (eased pan + log-scale zoom).
+    fn fly_to(&mut self, to: Camera) {
+        self.fly = Some((self.cam, to, Instant::now()));
+    }
+
+    fn animate(&mut self, ctx: &egui::Context) {
+        let Some((from, to, start)) = self.fly else { return };
+        let t = (start.elapsed().as_secs_f64() / 0.35).min(1.0);
+        let e = 1.0 - (1.0 - t).powi(3);
+        let lerp = |a: f64, b: f64| a + (b - a) * e;
+        self.cam = Camera { cx: lerp(from.cx, to.cx), cy: lerp(from.cy, to.cy), mpp: (lerp(from.mpp.ln(), to.mpp.ln())).exp() };
+        if t >= 1.0 {
+            self.fly = None;
+        } else {
+            ctx.request_repaint();
         }
+    }
+
+    /// Bookmarks belong to the open project (server) or mosaic (local).
+    fn bookmark_key(&self) -> Option<String> {
+        if let Some(o) = &self.server.open {
+            let base = self.server.client.as_ref().map(|c| c.base().to_string()).unwrap_or_default();
+            return Some(format!("{base}#project-{}", o.project.project_id));
+        }
+        let (id, _) = self.active.as_ref()?;
+        self.layers.iter().find(|l| l.id == *id).map(|l| l.uri.clone())
+    }
+
+    fn bookmarks_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(key) = self.bookmark_key() else { return };
+        let list = self.settings.bookmarks.get(&key).cloned().unwrap_or_default();
+        egui::CollapsingHeader::new(RichText::new(format!("Bookmarks ({})", list.len())).strong()).id_salt("bookmarks").default_open(!list.is_empty()).show(ui, |ui| {
+            let mut go = None;
+            let mut del = None;
+            for (i, b) in list.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let label = if i < 9 { format!("{}  {}", i + 1, b.name) } else { b.name.clone() };
+                    if ui.selectable_label(false, label).on_hover_text("Fly to this view (number key)").clicked() {
+                        go = Some(i);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✖").clicked() {
+                            del = Some(i);
+                        }
+                    });
+                });
+            }
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut self.bookmark_name).hint_text(format!("View {}", list.len() + 1)).desired_width(130.0));
+                let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("＋ Save view").on_hover_text("Ctrl+B").clicked() || enter {
+                    self.save_bookmark();
+                }
+            });
+            if let Some(i) = go {
+                self.go_bookmark(i);
+            }
+            if let (Some(i), Some(v)) = (del, self.settings.bookmarks.get_mut(&key)) {
+                v.remove(i);
+            }
+        });
+    }
+
+    fn save_bookmark(&mut self) {
+        let Some(key) = self.bookmark_key() else { return };
+        let list = self.settings.bookmarks.entry(key).or_default();
+        let name = if self.bookmark_name.trim().is_empty() { format!("View {}", list.len() + 1) } else { self.bookmark_name.trim().to_string() };
+        list.push(settings::Bookmark { name: name.clone(), view: [self.cam.cx, self.cam.cy, self.cam.mpp] });
+        self.bookmark_name.clear();
+        self.editor.toast = Some((format!("Saved bookmark '{name}'"), Instant::now()));
+    }
+
+    fn go_bookmark(&mut self, i: usize) {
+        let Some(b) = self.bookmark_key().and_then(|k| self.settings.bookmarks.get(&k)).and_then(|l| l.get(i)).cloned() else { return };
+        self.fly_to(Camera { cx: b.view[0], cy: b.view[1], mpp: b.view[2] });
     }
 
     fn export(&mut self, csv: bool) {
@@ -579,6 +730,17 @@ impl CatApp {
                 ui.checkbox(&mut self.settings.show_table, "Annotation table   T");
                 ui.separator();
                 ui.checkbox(&mut self.editor.style.labels, "Species labels");
+                ui.menu_button("Colour annotations by", |ui| {
+                    for m in editor::ColorBy::ALL {
+                        ui.radio_value(&mut self.editor.style.color_by, m, m.label());
+                    }
+                });
+                ui.checkbox(&mut self.settings.show_legend, "Legend");
+                ui.horizontal(|ui| {
+                    ui.label("🐱 Break reminder");
+                    ui.add(egui::DragValue::new(&mut self.settings.break_minutes).range(0..=180).suffix(" min"));
+                    ui.weak("(0 = off)");
+                });
                 ui.horizontal(|ui| {
                     ui.label("Line width");
                     ui.add(egui::Slider::new(&mut self.editor.style.line_width, 1.0..=8.0));
@@ -603,6 +765,10 @@ impl CatApp {
                 egui::widgets::global_theme_preference_buttons(ui);
             });
             ui.menu_button("Help", |ui| {
+                if ui.button("Performance & graphics…").clicked() {
+                    self.show_perf = true;
+                    ui.close();
+                }
                 if ui.button("Keyboard shortcuts   ?").clicked() {
                     self.show_shortcuts = true;
                     ui.close();
@@ -939,6 +1105,7 @@ impl CatApp {
             self.fit_to(id);
         }
 
+        self.bookmarks_ui(ui);
         ui.separator();
         ui.heading(if self.server.connected() { "Bucket mosaics (local annotation)" } else { "Orthomosaics" });
         ui.weak(format!("gs://{}/…/orthomosaic_cog/", catalog::BUCKET));
@@ -966,12 +1133,21 @@ impl CatApp {
         let files: Vec<catalog::CogEntry> = self.catalog.files.iter().filter(|c| f.is_empty() || c.file_name().to_uppercase().contains(&f)).cloned().collect();
         ui.weak(format!("{} mosaics · click to open, Ctrl+click to add", files.len()));
         let open: Vec<String> = self.layers.iter().map(|l| l.uri.clone()).collect();
+        // Which mosaics have local annotation files: list the folder every few
+        // seconds instead of checking the disk for every row every frame.
+        if self.annotated_at.elapsed() > Duration::from_secs(5) {
+            self.annotated_at = Instant::now();
+            self.annotated = std::fs::read_dir(data_dir().join("annotations"))
+                .map(|d| d.filter_map(|e| e.ok().map(|e| e.path())).collect())
+                .unwrap_or_default();
+        }
+        let annotated = &self.annotated;
         let mut clicked = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, 20.0, files.len(), |ui, range| {
             for c in &files[range] {
                 let uri = c.uri();
                 let is_open = open.contains(&uri);
-                let has_ann = annotations_path(&uri).exists();
+                let has_ann = annotated.contains(&annotations_path(&uri));
                 let r = ui.horizontal(|ui| {
                     let r = ui.selectable_label(is_open, c.site());
                     if has_ann {
@@ -1047,6 +1223,19 @@ impl CatApp {
             }
             ui.separator();
             ui.label(format!("⏱ {}", fmt_duration(self.timer.secs))).on_hover_text("Active annotation time this session (pauses after 2 min idle)");
+            // Cat buddy: a gentle nudge after a long stretch without a break.
+            let mins = self.settings.break_minutes as f64;
+            if mins > 0.0 && self.timer.since_break >= mins * 60.0 && self.timer.since_break >= self.break_snooze_until {
+                let worked = (self.timer.since_break / 60.0) as u64;
+                let cat = if self.timer.since_break > mins * 60.0 * 1.5 { "😾" } else { "😺" };
+                if ui
+                    .button(RichText::new(format!("{cat} {worked} min without a break — stretch?")).color(Color32::from_rgb(230, 180, 0)))
+                    .on_hover_text("Click to snooze. Rests your eyes and keeps IDs sharp. Change the interval in View → Break reminder.")
+                    .clicked()
+                {
+                    self.break_snooze_until = self.timer.since_break + (mins * 30.0).clamp(60.0, 1800.0);
+                }
+            }
             ui.separator();
             match self.hover {
                 Some((lon, lat)) => ui.monospace(format!("{lat:.8}, {lon:.8}")),
@@ -1072,6 +1261,61 @@ impl CatApp {
                 }
             }
         });
+    }
+
+    /// Map legend (bottom-right): colour mode, values with counts; click a
+    /// value to select all its annotations.
+    fn legend(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        // Recompute only when annotations change.
+        if self.legend_cache.0 != (self.editor.rev, self.editor.style.color_by) {
+            self.legend_cache = ((self.editor.rev, self.editor.style.color_by), self.editor.legend());
+        }
+        let entries = self.legend_cache.1.clone();
+        let mut pick = None;
+        egui::Area::new(egui::Id::unique("legend"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -10.0])
+            .constrain_to(rect)
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(8.0).show(ui, |ui| {
+                    ui.set_max_width(230.0);
+                    egui::ComboBox::from_id_salt("colorby").selected_text(self.editor.style.color_by.label()).width(210.0).show_ui(ui, |ui| {
+                        for m in editor::ColorBy::ALL {
+                            ui.selectable_value(&mut self.editor.style.color_by, m, m.label());
+                        }
+                    });
+                    let max = 12;
+                    for (value, color, n) in entries.iter().take(max) {
+                        let label = value.clone().unwrap_or_else(|| "— (none)".into());
+                        let name = if self.editor.style.color_by == editor::ColorBy::Species {
+                            value.as_ref().and_then(|v| self.form.species.get(v)).map(|s| s.name.clone()).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        let r = ui.horizontal(|ui| {
+                            let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                            ui.painter().rect_filled(dot, 2.0, *color);
+                            let r = ui.add(egui::Label::new(RichText::new(&label).monospace()).sense(egui::Sense::click()));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.weak(n.to_string());
+                            });
+                            r
+                        });
+                        let r = r.inner.on_hover_text(if name.is_empty() { format!("Click to select all {n}") } else { format!("{name} — click to select all {n}") });
+                        if r.clicked() {
+                            pick = Some(value.clone());
+                        }
+                    }
+                    if entries.len() > max {
+                        ui.weak(format!("+ {} more", entries.len() - max));
+                    }
+                });
+            });
+        if let Some(v) = pick {
+            self.form.commit(&mut self.editor);
+            self.editor.select_value(&v);
+            self.settings.show_form = true;
+        }
     }
 
     fn tool_bar(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
@@ -1131,6 +1375,15 @@ impl CatApp {
         if same {
             self.form.same_as_last(&mut self.editor);
         }
+        if ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::B))) {
+            self.save_bookmark();
+        }
+        if !typing {
+            let keys = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5, egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9];
+            if let Some(i) = keys.iter().position(|k| ctx.input(|inp| inp.key_pressed(*k) && !inp.modifiers.any())) {
+                self.go_bookmark(i);
+            }
+        }
         if typing {
             return;
         }
@@ -1138,7 +1391,7 @@ impl CatApp {
             if i.modifiers.command || i.modifiers.alt {
                 return;
             }
-            for (k, t) in [(egui::Key::V, Tool::Select), (egui::Key::P, Tool::Point), (egui::Key::L, Tool::Line), (egui::Key::R, Tool::Rect), (egui::Key::G, Tool::Polygon)] {
+            for (k, t) in [(egui::Key::V, Tool::Select), (egui::Key::P, Tool::Point), (egui::Key::L, Tool::Line), (egui::Key::R, Tool::Rect), (egui::Key::G, Tool::Polygon), (egui::Key::M, Tool::Measure)] {
                 if i.key_pressed(k) {
                     self.editor.set_tool(t);
                 }
@@ -1177,11 +1430,56 @@ impl CatApp {
         }
     }
 
+    fn perf_window(&mut self, ctx: &egui::Context) {
+        if !self.show_perf {
+            return;
+        }
+        let mut open = true;
+        let mut v: Vec<f32> = self.frame_ms.iter().copied().collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        let pick = |q: f32| v.get(((v.len() as f32 - 1.0) * q) as usize).copied().unwrap_or(0.0);
+        let dt = ctx.input(|i| i.unstable_dt) * 1000.0;
+        egui::Window::new("Performance & graphics").open(&mut open).resizable(false).show(ctx, |ui| {
+            egui::Grid::new("perf").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("Graphics");
+                ui.label(self.gfx_info.clone().unwrap_or_default());
+                ui.end_row();
+                ui.label("App work per frame");
+                ui.monospace(format!("median {:.1} ms · 95% {:.1} ms · worst {:.1} ms", pick(0.5), pick(0.95), pick(1.0)));
+                ui.end_row();
+                ui.label("Last frame interval");
+                ui.monospace(format!("{dt:.1} ms"));
+                ui.end_row();
+                ui.label("Annotations / tiles loading");
+                ui.monospace(format!("{} / {}", self.editor.items.len(), self.tiles.pending_count()));
+                ui.end_row();
+            });
+            if self.software_gpu {
+                ui.colored_label(Color32::from_rgb(230, 80, 60), "⚠ Software rendering (no graphics card in use). Update the graphics driver, or try OpenGL below.");
+            }
+            ui.separator();
+            ui.label("Renderer (applies next time CAT starts)");
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.settings.renderer, "auto".to_string(), "DirectX 12 / Vulkan (default)");
+                ui.radio_value(&mut self.settings.renderer, "opengl".to_string(), "OpenGL (try if drawing is choppy)");
+            });
+            ui.checkbox(&mut self.settings.low_latency, "Low input latency (line follows the cursor more closely)");
+            ui.weak("Under ~8 ms of app work per frame is smooth. If it's low but drawing still lags, the graphics driver or renderer is the cause — try OpenGL.");
+        });
+        if !open {
+            self.show_perf = false;
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
     fn shortcuts_window(&mut self, ctx: &egui::Context) {
         egui::Window::new("Keyboard shortcuts").open(&mut self.show_shortcuts).resizable(false).collapsible(false).show(ctx, |ui| {
             egui::Grid::new("keys").striped(true).show(ui, |ui| {
                 for (k, v) in [
-                    ("V / P / L / R / G", "Select / Point / Line / Rectangle / Polygon tool"),
+                    ("V / P / L / R / G / M", "Select / Point / Line / Rectangle / Polygon / Measure"),
+                    ("Shift+drag (Line, Polygon)", "Trace freehand; a new outline finishes on release"),
+                    ("Right-click", "Finish line or polygon"),
+                    ("Ctrl+Z while drawing", "Remove the last vertex"),
                     ("Click", "Add vertex (drawing) · select (Select tool)"),
                     ("Enter / double-click", "Finish line or polygon"),
                     ("Backspace", "Remove last vertex while drawing"),
@@ -1189,6 +1487,7 @@ impl CatApp {
                     ("Species: type, ↑↓, Enter", "Pick species; Enter again = done, draw next"),
                     ("Ctrl+D", "Same attributes as last annotation"),
                     ("N", "Next annotation that needs a species"),
+                    ("Ctrl+B · 1–9", "Save view as bookmark · fly to bookmark"),
                     ("Shift+click / Shift+drag", "Add to selection / lasso select"),
                     ("Ctrl+A", "Select all (then bulk edit in the panel)"),
                     ("↑ / ↓ over the table", "Previous / next row"),
@@ -1212,7 +1511,7 @@ impl CatApp {
         });
     }
 
-    fn update_title(&self, ctx: &egui::Context) {
+    fn update_title(&mut self, ctx: &egui::Context) {
         let name = match &self.server.open {
             Some(o) => Some(format!("{} [{}]", o.project.project_name, self.server.profile.as_ref().map(|p| p.name.as_str()).unwrap_or("server"))),
             None => self.active.as_ref().and_then(|(id, _)| self.layers.iter().find(|l| l.id == *id)).map(|l| l.name.clone()),
@@ -1222,7 +1521,10 @@ impl CatApp {
             Some(n) => format!("CAT — {n}{dirty}"),
             None => "CAT — Coral Annotation Tool".into(),
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
     }
 
     /// Write settings (incl. open mosaics and view) if anything changed, so a
@@ -1248,8 +1550,21 @@ fn fmt_duration(s: f64) -> String {
 }
 
 impl eframe::App for CatApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
+        if self.gfx_info.is_none() {
+            self.gfx_info = Some(match frame.wgpu_render_state() {
+                Some(rs) => {
+                    let i = rs.adapter.get_info();
+                    self.software_gpu = i.device_type == eframe::wgpu::DeviceType::Cpu;
+                    format!("{} · {:?} · {:?} · driver {}", i.name, i.backend, i.device_type, i.driver_info)
+                }
+                None => "OpenGL (glow)".into(),
+            });
+            if self.software_gpu {
+                self.errors.push("Windows is drawing CAT without a graphics card (software rendering), which makes the map slow. Help → Performance & graphics has options; updating the graphics driver usually fixes this.".into());
+            }
+        }
         let ctx = ui.ctx().clone();
         let had_input = ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving());
         self.timer.tick(had_input);
@@ -1276,9 +1591,11 @@ impl eframe::App for CatApp {
         self.handle_server_events();
         self.shortcuts(&ctx);
 
+        let mut prof = Prof::new();
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("side").resizable(true).default_size(260.0).show(ui, |ui| self.side_panel(ui));
+        prof.mark("side");
         if self.settings.show_form {
             egui::Panel::right("form").resizable(true).default_size(340.0).min_size(280.0).show(ui, |ui| {
                 ui.add_space(4.0);
@@ -1289,6 +1606,7 @@ impl eframe::App for CatApp {
                 }
             });
         }
+        prof.mark("form");
         if self.settings.show_table {
             egui::Panel::bottom("table").resizable(true).default_size(200.0).min_size(90.0).show(ui, |ui| {
                 ui.add_space(4.0);
@@ -1299,6 +1617,8 @@ impl eframe::App for CatApp {
                 }
             });
         }
+        prof.mark("table");
+        self.animate(&ctx);
         egui::CentralPanel::no_frame().show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
             let primary_pan = self.editor.pre_input(ui, rect, &self.cam);
@@ -1307,10 +1627,16 @@ impl eframe::App for CatApp {
             self.map_rect = out.rect;
             self.hover = out.hover_lonlat;
             self.level = out.level;
+            prof.mark("map");
             let ev = self.editor.ui(ui, &out.resp, out.rect, &mut self.cam, self.timer.secs);
+            prof.mark("editor");
             if ev.created.is_some() {
                 self.settings.show_form = true;
                 self.form.focus_species();
+                self.session_created += 1;
+                if self.session_created.is_multiple_of(50) {
+                    self.editor.toast = Some((format!("🐱 {} annotations this session — nice work!", self.session_created), Instant::now()));
+                }
             }
             if let Some(b) = ev.zoom_to {
                 self.zoom_to_bbox(b);
@@ -1333,6 +1659,9 @@ impl eframe::App for CatApp {
                 }
             }
             map::scale_bar(&ui.painter_at(out.rect), out.rect, &self.cam);
+            if self.settings.show_legend && !self.editor.items.is_empty() {
+                self.legend(ui, out.rect);
+            }
             self.tool_bar(ui, out.rect);
             if self.layers.iter().any(|l| matches!(l.state, LayerState::Opening)) {
                 ui.put(
@@ -1372,22 +1701,29 @@ impl eframe::App for CatApp {
         self.drive_sync();
         if self.server.round_done {
             self.server.round_done = false;
-            if let Some(o) = &self.server.open {
-                let _ = server::write_journal(&o.journal, &self.editor.items, &o.sync);
+            // Sync state changed: rewrite the journal in the background.
+            if let Some(job) = self.save_job() {
+                self.saver.submit(self.editor.rev, job);
             }
         }
         if self.save_state == SaveState::Pending {
             ctx.request_repaint_after(Duration::from_millis(300));
         }
+        prof.mark("rest");
         self.update_title(&ctx);
         if self.persist_check.elapsed() > Duration::from_secs(3) {
             self.persist_check = Instant::now();
             self.persist();
         }
         ctx.request_repaint_after(Duration::from_secs(3));
+        self.frame_ms.push_back(frame_start.elapsed().as_secs_f32() * 1000.0);
+        if self.frame_ms.len() > 240 {
+            self.frame_ms.pop_front();
+        }
+        self.perf_window(&ctx);
         // CAT_PERF=1: log CPU time per frame (for performance checks).
         if std::env::var_os("CAT_PERF").is_some() {
-            eprintln!("frame_ms {:.2} items {}", frame_start.elapsed().as_secs_f64() * 1000.0, self.editor.items.len());
+            eprintln!("frame_ms {:.2} items {} {}", frame_start.elapsed().as_secs_f64() * 1000.0, self.editor.items.len(), prof.report());
         }
     }
 
@@ -1400,4 +1736,24 @@ impl eframe::App for CatApp {
 
 fn ctx_repaint(ui: &egui::Ui, ms: u64) {
     ui.ctx().request_repaint_after(Duration::from_millis(ms));
+}
+
+/// Section timer for CAT_PERF.
+struct Prof {
+    last: Instant,
+    parts: Vec<(&'static str, f64)>,
+}
+
+impl Prof {
+    fn new() -> Self {
+        Prof { last: Instant::now(), parts: Vec::new() }
+    }
+    fn mark(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.parts.push((name, (now - self.last).as_secs_f64() * 1000.0));
+        self.last = now;
+    }
+    fn report(&self) -> String {
+        self.parts.iter().map(|(n, t)| format!("{n}={t:.2}")).collect::<Vec<_>>().join(" ")
+    }
 }

@@ -23,10 +23,11 @@ pub enum Tool {
     Line,
     Rect,
     Polygon,
+    Measure,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 5] = [Tool::Select, Tool::Point, Tool::Line, Tool::Rect, Tool::Polygon];
+    pub const ALL: [Tool; 6] = [Tool::Select, Tool::Point, Tool::Line, Tool::Rect, Tool::Polygon, Tool::Measure];
     pub fn label(self) -> &'static str {
         match self {
             Tool::Select => "⬉ Select",
@@ -34,6 +35,7 @@ impl Tool {
             Tool::Line => "╱ Line",
             Tool::Rect => "▭ Rectangle",
             Tool::Polygon => "⬠ Polygon",
+            Tool::Measure => "📏 Measure",
         }
     }
     pub fn key(self) -> &'static str {
@@ -43,15 +45,17 @@ impl Tool {
             Tool::Line => "L",
             Tool::Rect => "R",
             Tool::Polygon => "G",
+            Tool::Measure => "M",
         }
     }
     pub fn help(self) -> &'static str {
         match self {
             Tool::Select => "Click a feature to select it. Drag vertices to reshape, drag the small dots to add a vertex, Alt+click a vertex to remove it, drag inside to move.",
             Tool::Point => "Click to place a point.",
-            Tool::Line => "Click to add vertices. Double-click or Enter to finish, Backspace removes the last vertex, Esc cancels.",
+            Tool::Line => "Click to add vertices, or Shift+drag to trace freehand. Double-click, right-click or Enter finishes; Backspace/Ctrl+Z removes the last vertex; Esc cancels.",
             Tool::Rect => "Drag to draw a rectangle.",
-            Tool::Polygon => "Click to add vertices. Click the first vertex, double-click or press Enter to finish. Backspace removes the last vertex, Esc cancels.",
+            Tool::Polygon => "Click to add vertices, or Shift+drag to trace an outline in one stroke. Click the first vertex, double-click, right-click or Enter finishes; Backspace/Ctrl+Z removes the last vertex; Esc cancels.",
+            Tool::Measure => "Click to measure distances (each segment and total); 3+ points also show the area. Double-click or Enter ends, Esc clears. Nothing is saved.",
         }
     }
 }
@@ -64,12 +68,68 @@ pub struct Style {
     pub labels: bool,
     pub complete: [u8; 3],
     pub incomplete: [u8; 3],
+    pub color_by: ColorBy,
+}
+
+/// What annotation colours mean (same modes and colours as the web app's
+/// symbology, annotation-runtime-symbology.js).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ColorBy {
+    /// Complete vs needs species.
+    #[default]
+    Status,
+    Species,
+    Condition,
+    Annotator,
+}
+
+impl ColorBy {
+    pub const ALL: [ColorBy; 4] = [ColorBy::Status, ColorBy::Species, ColorBy::Condition, ColorBy::Annotator];
+    pub fn label(self) -> &'static str {
+        match self {
+            ColorBy::Status => "Status (complete / needs species)",
+            ColorBy::Species => "Species",
+            ColorBy::Condition => "Condition (con_1)",
+            ColorBy::Annotator => "Annotator",
+        }
+    }
+    pub fn value(self, a: &Annotation) -> Option<String> {
+        let v = match self {
+            ColorBy::Status => return Some(if a.is_complete() { "Complete".into() } else { "Needs species".into() }),
+            ColorBy::Species => a.spcode(),
+            ColorBy::Condition => a.text("con_1"),
+            ColorBy::Annotator => {
+                let c = a.text("created_by");
+                if c.is_empty() { a.text("analyst") } else { c }
+            }
+        };
+        let v = v.trim().to_uppercase();
+        (!v.is_empty() && v != "-").then_some(v)
+    }
+}
+
+const PALETTE: [u32; 24] = [
+    0xe6194b, 0x3cb44b, 0x4363d8, 0xf58231, 0x911eb4, 0x46f0f0, 0xf032e6, 0xbcf60c, 0x008080, 0x9a6324, 0x800000, 0x808000,
+    0x000075, 0xe6beff, 0xfabebe, 0xffd8b1, 0xaaffc3, 0xffe119, 0x1f77b4, 0xd62728, 0x2ca02c, 0x8c564b, 0x17becf, 0x7f7f7f,
+];
+pub const MISSING: Color32 = Color32::from_rgb(0x9c, 0xa3, 0xaf);
+
+/// Stable colour for a value: FNV-1a of the upper-cased text into the
+/// palette — identical to the web app, so colours match across both.
+pub fn color_for(value: &str) -> Color32 {
+    let mut h: u32 = 2166136261;
+    for c in value.trim().to_uppercase().encode_utf16() {
+        h ^= c as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    let c = PALETTE[(h as usize) % PALETTE.len()];
+    Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
 impl Default for Style {
     fn default() -> Self {
         // Same defaults as the web app: bright pink-red stands out on reef imagery.
-        Style { line_width: 2.5, fill_opacity: 0.18, labels: true, complete: [0xff, 0x2d, 0x6f], incomplete: [0xff, 0xd0, 0x00] }
+        Style { line_width: 2.5, fill_opacity: 0.18, labels: true, complete: [0xff, 0x2d, 0x6f], incomplete: [0xff, 0xd0, 0x00], color_by: ColorBy::Status }
     }
 }
 
@@ -79,6 +139,8 @@ enum Drag {
     RectDraw { start: [f64; 2] },
     /// Shift+drag freehand selection (screen points).
     Lasso { pts: Vec<Pos2> },
+    /// Shift+drag freehand tracing in the line/polygon tools (WebMercator).
+    Trace { pts: Vec<[f64; 2]>, new_shape: bool },
 }
 
 /// What the app should react to after a frame.
@@ -111,8 +173,14 @@ pub struct Editor {
     /// Viewer role on a server project: look, select, but don't change.
     pub read_only: bool,
     drawing: Vec<[f64; 2]>,
+    /// Measure tool points and whether the measurement is finished.
+    measure: Vec<[f64; 2]>,
+    measure_done: bool,
     drag: Option<Drag>,
-    tri_cache: HashMap<String, (u64, Vec<u32>)>,
+    /// Per-annotation WebMercator projection + fill triangles, reused until
+    /// the geometry changes (projecting every vertex every frame was the
+    /// editor's main per-frame cost).
+    proj: HashMap<String, Proj>,
     hover_vertex_close: bool,
 }
 
@@ -132,6 +200,29 @@ fn rgb(c: [u8; 3]) -> Color32 {
     Color32::from_rgb(c[0], c[1], c[2])
 }
 
+struct Proj {
+    geom: Geom,
+    merc: Vec<[f64; 2]>,
+    /// min_x, min_y, max_x, max_y in WebMercator metres.
+    bbox: [f64; 4],
+    tris: Option<Vec<u32>>,
+}
+
+impl Proj {
+    fn new(g: &Geom) -> Proj {
+        let merc: Vec<[f64; 2]> = g.vertices().iter().map(|p| ll_to_merc(*p)).collect();
+        let mut bbox = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+        for m in &merc {
+            bbox = [bbox[0].min(m[0]), bbox[1].min(m[1]), bbox[2].max(m[0]), bbox[3].max(m[1])];
+        }
+        Proj { geom: g.clone(), merc, bbox, tris: None }
+    }
+    fn visible(&self, v: &cat_cog::MercBox, pad: f64) -> bool {
+        !(self.bbox[2] < v.min_x - pad || self.bbox[0] > v.max_x + pad || self.bbox[3] < v.min_y - pad || self.bbox[1] > v.max_y + pad)
+    }
+}
+
+#[allow(dead_code)]
 fn geom_hash(g: &Geom) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -158,8 +249,10 @@ impl Editor {
             toast: None,
             read_only: false,
             drawing: Vec::new(),
+            measure: Vec::new(),
+            measure_done: false,
             drag: None,
-            tri_cache: HashMap::new(),
+            proj: HashMap::new(),
             hover_vertex_close: false,
         }
     }
@@ -175,12 +268,12 @@ impl Editor {
         self.multi.clear();
         self.drawing.clear();
         self.drag = None;
-        self.tri_cache.clear();
+        self.proj.clear();
         self.rev += 1;
     }
 
     pub fn is_drawing(&self) -> bool {
-        !self.drawing.is_empty() || matches!(self.drag, Some(Drag::RectDraw { .. }))
+        !self.drawing.is_empty() || matches!(self.drag, Some(Drag::RectDraw { .. }) | Some(Drag::Trace { .. }))
     }
 
     pub fn get(&self, uuid: &str) -> Option<&Annotation> {
@@ -221,7 +314,16 @@ impl Editor {
     }
 
     pub fn undo(&mut self) {
-        self.drawing.clear();
+        // Mid-shape, undo means "remove the last vertex", not "lose the shape".
+        if !self.drawing.is_empty() {
+            self.drawing.pop();
+            return;
+        }
+        if self.tool == Tool::Measure && !self.measure.is_empty() {
+            self.measure.pop();
+            self.measure_done = false;
+            return;
+        }
         if let Some(l) = self.history.undo(&mut self.items) {
             self.rev += 1;
             self.toast(format!("Undo: {l}"));
@@ -324,6 +426,29 @@ impl Editor {
     // Hit testing (screen space)
     // ---------------------------------------------------------------------
 
+    /// Bring the projection cache in line with `items` (cheap when nothing changed).
+    fn refresh_proj(&mut self) {
+        for a in &self.items {
+            match self.proj.get(&a.uuid) {
+                Some(p) if p.geom == a.geom => {}
+                _ => {
+                    self.proj.insert(a.uuid.clone(), Proj::new(&a.geom));
+                }
+            }
+        }
+        if self.proj.len() > self.items.len() + 256 {
+            let live: std::collections::HashSet<&str> = self.items.iter().map(|a| a.uuid.as_str()).collect();
+            self.proj.retain(|k, _| live.contains(k.as_str()));
+        }
+    }
+
+    fn screen_pts_of(&self, cam: &Camera, rect: Rect, a: &Annotation) -> Vec<Pos2> {
+        match self.proj.get(&a.uuid).filter(|p| p.geom == a.geom) {
+            Some(p) => p.merc.iter().map(|m| cam.to_screen(rect, m[0], m[1])).collect(),
+            None => Self::screen_pts(cam, rect, a),
+        }
+    }
+
     fn screen_pts(cam: &Camera, rect: Rect, a: &Annotation) -> Vec<Pos2> {
         a.geom.vertices().iter().map(|p| {
             let m = ll_to_merc(*p);
@@ -336,8 +461,14 @@ impl Editor {
     fn hit(&self, cam: &Camera, rect: Rect, p: Pos2) -> Option<String> {
         let pp = [p.x as f64, p.y as f64];
         let mut best: Option<(f64, &str)> = None;
+        let (wx, wy) = cam.to_world(rect, p);
+        let pad = 12.0 * cam.mpp;
+        let probe = cat_cog::MercBox { min_x: wx, max_x: wx, min_y: wy, max_y: wy };
         for a in self.items.iter().rev() {
-            let pts: Vec<[f64; 2]> = Self::screen_pts(cam, rect, a).iter().map(|q| [q.x as f64, q.y as f64]).collect();
+            if self.proj.get(&a.uuid).is_some_and(|pr| !pr.visible(&probe, pad)) {
+                continue;
+            }
+            let pts: Vec<[f64; 2]> = self.screen_pts_of(cam, rect, a).iter().map(|q| [q.x as f64, q.y as f64]).collect();
             let d = match &a.geom {
                 Geom::Point(_) => geom::dist2(pp, pts[0]).sqrt(),
                 Geom::Line(_) => geom::point_polyline(pp, &pts, false).0,
@@ -367,16 +498,18 @@ impl Editor {
     /// Nearest vertex of any annotation other than `exclude`, within SNAP_PX.
     fn snap_target(&self, cam: &Camera, rect: Rect, p: Pos2, exclude: Option<&str>) -> Option<[f64; 2]> {
         let mut best: Option<(f32, [f64; 2])> = None;
-        let view = cam.view_box(rect);
+        let (wx, wy) = cam.to_world(rect, p);
+        let pad = SNAP_PX as f64 * cam.mpp;
+        let probe = cat_cog::MercBox { min_x: wx, max_x: wx, min_y: wy, max_y: wy };
         for a in &self.items {
             if Some(a.uuid.as_str()) == exclude {
                 continue;
             }
-            for v in a.geom.vertices() {
-                let m = ll_to_merc(*v);
-                if m[0] < view.min_x || m[0] > view.max_x || m[1] < view.min_y || m[1] > view.max_y {
-                    continue;
-                }
+            let Some(pr) = self.proj.get(&a.uuid) else { continue };
+            if !pr.visible(&probe, pad) {
+                continue;
+            }
+            for &m in &pr.merc {
                 let d = cam.to_screen(rect, m[0], m[1]).distance(p);
                 if d < SNAP_PX && best.is_none_or(|b| d < b.0) {
                     best = Some((d, m));
@@ -412,6 +545,10 @@ impl Editor {
                 match self.tool {
                     Tool::Rect => self.drag = Some(Drag::RectDraw { start: Self::world(cam, rect, o) }),
                     Tool::Select if shift => self.drag = Some(Drag::Lasso { pts: vec![o] }),
+                    Tool::Line | Tool::Polygon if shift && !self.read_only => {
+                        let new_shape = self.drawing.is_empty();
+                        self.drag = Some(Drag::Trace { pts: vec![Self::world(cam, rect, o)], new_shape })
+                    }
                     Tool::Select if !alt => self.start_select_drag(cam, rect, o),
                     _ => {}
                 }
@@ -425,7 +562,7 @@ impl Editor {
             return;
         }
         let Some(sel) = self.selected_ann().cloned() else { return };
-        let pts = Self::screen_pts(cam, rect, &sel);
+        let pts = self.screen_pts_of(cam, rect, &sel);
         if let Some(idx) = pts.iter().position(|p| p.distance(o) <= HANDLE + 2.0) {
             self.drag = Some(Drag::Vertex { uuid: sel.uuid.clone(), idx, before: sel });
             return;
@@ -467,12 +604,13 @@ impl Editor {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, resp: &egui::Response, rect: Rect, cam: &mut Camera, active_secs: f64) -> Events {
         let mut ev = Events::default();
+        self.refresh_proj();
         let hover = resp.hover_pos();
         let keys_free = !ui.ctx().egui_wants_keyboard_input();
         let (alt, space) = ui.input(|i| (i.modifiers.alt, i.key_down(egui::Key::Space)));
 
         // Snap only while placing or dragging vertices.
-        let placing = matches!(self.tool, Tool::Point | Tool::Line | Tool::Polygon | Tool::Rect);
+        let placing = matches!(self.tool, Tool::Point | Tool::Line | Tool::Polygon | Tool::Rect | Tool::Measure);
         let dragging_vertex = match &self.drag {
             Some(Drag::Vertex { uuid, .. }) => Some(uuid.clone()),
             _ => None,
@@ -504,7 +642,7 @@ impl Editor {
                 self.selected = None;
                 self.toast(format!("{} selected · set attributes in the panel, Del to delete", self.multi.len()));
             }
-            if esc {
+            if esc && !(self.tool == Tool::Measure && !self.measure.is_empty()) {
                 if self.is_drawing() {
                     self.drawing.clear();
                     self.drag = None;
@@ -529,8 +667,31 @@ impl Editor {
                     }
                 }
             }
+            Tool::Line | Tool::Polygon if matches!(self.drag, Some(Drag::Trace { .. })) => {
+                if let Some(Drag::Trace { mut pts, new_shape }) = self.drag.take() {
+                    if let Some(w) = cursor_world {
+                        let last = *pts.last().unwrap();
+                        if cam.to_screen(rect, last[0], last[1]).distance(cam.to_screen(rect, w[0], w[1])) >= 3.0 {
+                            pts.push(w);
+                        }
+                    }
+                    let down = ui.input(|i| i.pointer.primary_down());
+                    if down {
+                        self.drag = Some(Drag::Trace { pts, new_shape });
+                    } else {
+                        // Simplify the stroke to ~1 px, then add it to the shape.
+                        let simplified = simplify(&pts, cam.mpp * 1.0);
+                        self.drawing.extend(simplified);
+                        if new_shape && self.drawing.len() >= if self.tool == Tool::Line { 2 } else { 3 } {
+                            self.finish_drawing(active_secs, &mut ev);
+                        }
+                    }
+                }
+            }
             Tool::Line | Tool::Polygon => {
-                if double {
+                if resp.secondary_clicked() && !self.drawing.is_empty() {
+                    self.finish_drawing(active_secs, &mut ev);
+                } else if double {
                     // The second click of a double-click also arrived as a click.
                     if self.drawing.len() >= 2 {
                         let n = self.drawing.len();
@@ -554,6 +715,31 @@ impl Editor {
                             self.drawing.push(w);
                         }
                     }
+                }
+            }
+            Tool::Measure => {
+                if double || (keys_free && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    if self.measure.len() >= 2 {
+                        let n = self.measure.len();
+                        let a = cam.to_screen(rect, self.measure[n - 1][0], self.measure[n - 1][1]);
+                        let b = cam.to_screen(rect, self.measure[n - 2][0], self.measure[n - 2][1]);
+                        if a.distance(b) < 4.0 {
+                            self.measure.pop();
+                        }
+                    }
+                    self.measure_done = true;
+                } else if clicked {
+                    if let Some(w) = cursor_world {
+                        if self.measure_done {
+                            self.measure.clear();
+                            self.measure_done = false;
+                        }
+                        self.measure.push(w);
+                    }
+                }
+                if keys_free && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.measure.clear();
+                    self.measure_done = false;
                 }
             }
             Tool::Rect => {
@@ -652,7 +838,7 @@ impl Editor {
             return;
         }
         let Some(sel) = self.selected_ann().cloned() else { return };
-        let pts = Self::screen_pts(cam, rect, &sel);
+        let pts = self.screen_pts_of(cam, rect, &sel);
         if let Some(idx) = pts.iter().position(|p| p.distance(h) <= HANDLE + 2.0) {
             let mut a = sel.clone();
             if let Geom::Line(v) | Geom::Polygon(v) = &mut a.geom {
@@ -672,7 +858,7 @@ impl Editor {
         let Some(drag) = self.drag.take() else {
             self.hover_vertex_close = false;
             if let (Some(sel), Some(h)) = (self.selected_ann(), resp.hover_pos()) {
-                self.hover_vertex_close = Self::screen_pts(cam, rect, sel).iter().any(|p| p.distance(h) <= HANDLE + 2.0);
+                self.hover_vertex_close = self.screen_pts_of(cam, rect, sel).iter().any(|p| p.distance(h) <= HANDLE + 2.0);
             }
             return;
         };
@@ -737,7 +923,7 @@ impl Editor {
                     self.drag = Some(Drag::Body { uuid, before, last });
                 }
             }
-            Drag::RectDraw { .. } => {}
+            Drag::RectDraw { .. } | Drag::Trace { .. } => {}
             Drag::Lasso { mut pts } => {
                 if let Some(p) = pointer {
                     if pts.last().is_none_or(|l| l.distance(p) > 3.0) {
@@ -749,7 +935,7 @@ impl Editor {
                         let poly: Vec<[f64; 2]> = pts.iter().map(|p| [p.x as f64, p.y as f64]).collect();
                         let mut hits = Vec::new();
                         for a in &self.items {
-                            let sp = Self::screen_pts(cam, rect, a);
+                            let sp = self.screen_pts_of(cam, rect, a);
                             let c = match &a.geom {
                                 Geom::Polygon(_) => {
                                     let r: Vec<[f64; 2]> = sp.iter().map(|p| [p.x as f64, p.y as f64]).collect();
@@ -789,16 +975,52 @@ impl Editor {
     // ---------------------------------------------------------------------
 
     fn triangles(&mut self, a: &Annotation) -> Vec<u32> {
-        let h = geom_hash(&a.geom);
-        if let Some((hh, t)) = self.tri_cache.get(&a.uuid) {
-            if *hh == h {
-                return t.clone();
-            }
+        let p = self.proj.entry(a.uuid.clone()).or_insert_with(|| Proj::new(&a.geom));
+        if p.tris.is_none() {
+            let flat: Vec<f64> = p.merc.iter().flat_map(|m| [m[0], m[1]]).collect();
+            p.tris = Some(earcutr::earcut(&flat, &[], 2).unwrap_or_default().into_iter().map(|i| i as u32).collect());
         }
-        let flat: Vec<f64> = a.geom.vertices().iter().flat_map(|p| [p[0], p[1]]).collect();
-        let t: Vec<u32> = earcutr::earcut(&flat, &[], 2).unwrap_or_default().into_iter().map(|i| i as u32).collect();
-        self.tri_cache.insert(a.uuid.clone(), (h, t.clone()));
-        t
+        p.tris.clone().unwrap_or_default()
+    }
+
+    pub fn color_of(&self, a: &Annotation) -> Color32 {
+        match self.style.color_by {
+            ColorBy::Status => {
+                if a.is_complete() { rgb(self.style.complete) } else { rgb(self.style.incomplete) }
+            }
+            mode => mode.value(a).map(|v| color_for(&v)).unwrap_or(MISSING),
+        }
+    }
+
+    /// Legend entries for the current colour mode: (value, colour, count).
+    pub fn legend(&self) -> Vec<(Option<String>, Color32, usize)> {
+        let mut counts: std::collections::BTreeMap<Option<String>, usize> = Default::default();
+        for a in &self.items {
+            *counts.entry(self.style.color_by.value(a)).or_default() += 1;
+        }
+        let mut v: Vec<(Option<String>, Color32, usize)> = counts
+            .into_iter()
+            .map(|(k, n)| {
+                let c = match (&k, self.style.color_by) {
+                    (Some(s), ColorBy::Status) => if s == "Complete" { rgb(self.style.complete) } else { rgb(self.style.incomplete) },
+                    (Some(s), _) => color_for(s),
+                    (None, _) => MISSING,
+                };
+                (k, c, n)
+            })
+            .collect();
+        v.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Select every annotation with this legend value (for bulk edits).
+    pub fn select_value(&mut self, value: &Option<String>) {
+        let mode = self.style.color_by;
+        self.multi = self.items.iter().filter(|a| &mode.value(a) == value).map(|a| a.uuid.clone()).collect();
+        self.selected = None;
+        if self.multi.len() == 1 {
+            self.selected = self.multi.pop();
+        }
     }
 
     fn paint(&mut self, painter: &egui::Painter, cam: &Camera, rect: Rect) {
@@ -807,15 +1029,13 @@ impl Editor {
         let items = std::mem::take(&mut self.items);
         let mut labels = Vec::new();
         for a in &items {
-            let b = a.geom.bbox();
-            let (lo, hi) = (ll_to_merc([b[0], b[1]]), ll_to_merc([b[2], b[3]]));
-            if hi[0] < view.min_x || lo[0] > view.max_x || hi[1] < view.min_y || lo[1] > view.max_y {
+            if self.proj.get(&a.uuid).is_some_and(|p| !p.visible(&view, 0.0)) {
                 continue;
             }
             let selected = self.selected.as_deref() == Some(a.uuid.as_str()) || self.multi.contains(&a.uuid);
-            let base = if a.is_complete() { rgb(self.style.complete) } else { rgb(self.style.incomplete) };
+            let base = self.color_of(a);
             let color = if selected { Color32::from_rgb(0, 230, 255) } else { base };
-            let pts = Self::screen_pts(cam, rect, a);
+            let pts = self.screen_pts_of(cam, rect, a);
             let stroke = Stroke::new(if selected { lw + 1.0 } else { lw }, color);
             // Zoomed out, a whole annotation can shrink to a few pixels: draw a dot.
             let bb = Rect::from_points(&pts);
@@ -896,9 +1116,60 @@ impl Editor {
         }
     }
 
+    fn paint_measure(&self, painter: &egui::Painter, cam: &Camera, rect: Rect, cursor_world: Option<[f64; 2]>) {
+        if self.tool != Tool::Measure || self.measure.is_empty() {
+            return;
+        }
+        let amber = Color32::from_rgb(255, 190, 40);
+        let mut pts = self.measure.clone();
+        if !self.measure_done {
+            if let Some(c) = cursor_world {
+                pts.push(c);
+            }
+        }
+        let sp: Vec<Pos2> = pts.iter().map(|m| cam.to_screen(rect, m[0], m[1])).collect();
+        let ll: Vec<LonLat> = pts.iter().map(|m| merc_to_ll(*m)).collect();
+        if ll.len() >= 3 {
+            let mut mesh = egui::Mesh::default();
+            let flat: Vec<f64> = sp.iter().flat_map(|p| [p.x as f64, p.y as f64]).collect();
+            for p in &sp {
+                mesh.colored_vertex(*p, amber.gamma_multiply(0.12));
+            }
+            mesh.indices = earcutr::earcut(&flat, &[], 2).unwrap_or_default().into_iter().map(|i| i as u32).collect();
+            painter.add(Shape::mesh(mesh));
+            painter.add(Shape::dashed_line(&[*sp.last().unwrap(), sp[0]], Stroke::new(1.0, amber.gamma_multiply(0.7)), 5.0, 4.0));
+        }
+        painter.add(Shape::line(sp.clone(), Stroke::new(2.5, amber)));
+        for w in sp.windows(2).zip(ll.windows(2)) {
+            let d = geom::length_m(w.1, false);
+            let mid = w.0[0].lerp(w.0[1], 0.5);
+            if w.0[0].distance(w.0[1]) > 40.0 {
+                measure_label(painter, mid + vec2(4.0, 4.0), &geom::fmt_length(d));
+            }
+        }
+        for p in &sp {
+            painter.circle(*p, 4.0, Color32::WHITE, Stroke::new(1.5, amber));
+        }
+        let total = geom::length_m(&ll, false);
+        let mut text = format!("Total {}", geom::fmt_length(total));
+        if ll.len() >= 3 {
+            text.push_str(&format!(" · area {}", geom::fmt_area(geom::area_m2(&ll))));
+        }
+        if let Some(last) = sp.last() {
+            measure_label(painter, *last + vec2(14.0, -26.0), &text);
+        }
+    }
+
     fn paint_drawing(&self, painter: &egui::Painter, cam: &Camera, rect: Rect, hover: Option<Pos2>, cursor_world: Option<[f64; 2]>) {
         let accent = Color32::from_rgb(0, 230, 255);
         let s = |m: &[f64; 2]| cam.to_screen(rect, m[0], m[1]);
+        self.paint_measure(painter, cam, rect, cursor_world);
+        if let Some(Drag::Trace { pts, .. }) = &self.drag {
+            let mut all: Vec<Pos2> = self.drawing.iter().map(s).collect();
+            all.extend(pts.iter().map(s));
+            painter.add(Shape::line(all, Stroke::new(2.0, accent)));
+            return;
+        }
         if let Some(Drag::Lasso { pts }) = &self.drag {
             if pts.len() >= 2 {
                 let mut closed = pts.clone();
@@ -952,6 +1223,32 @@ impl Editor {
             measure_label(painter, h + vec2(14.0, 14.0), &text);
         }
     }
+}
+
+/// Douglas–Peucker simplification with tolerance `tol` (same units as pts).
+fn simplify(pts: &[[f64; 2]], tol: f64) -> Vec<[f64; 2]> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut keep = vec![false; pts.len()];
+    keep[0] = true;
+    keep[pts.len() - 1] = true;
+    let mut stack = vec![(0usize, pts.len() - 1)];
+    while let Some((a, b)) = stack.pop() {
+        let mut best = (0.0, 0);
+        for i in a + 1..b {
+            let d = geom::point_segment(pts[i], pts[a], pts[b]).0;
+            if d > best.0 {
+                best = (d, i);
+            }
+        }
+        if best.0 > tol {
+            keep[best.1] = true;
+            stack.push((a, best.1));
+            stack.push((best.1, b));
+        }
+    }
+    pts.iter().zip(keep).filter(|(_, k)| *k).map(|(p, _)| *p).collect()
 }
 
 /// Drop points closer than `min_px` to the previously kept one.
