@@ -69,7 +69,17 @@ impl Camera {
     }
 }
 
+/// How the map may use mouse input this frame (the editor decides).
+#[derive(Clone, Copy)]
+pub struct Nav {
+    /// Primary-button drag pans the map (false while the editor owns the drag).
+    pub primary_pan: bool,
+    /// Double-click zooms in (false while drawing lines/polygons).
+    pub double_click_zoom: bool,
+}
+
 pub struct MapOutput {
+    pub resp: egui::Response,
     pub hover_lonlat: Option<(f64, f64)>,
     /// Level drawn for the top visible layer, and zoom as screen pixels per
     /// full-resolution image pixel.
@@ -78,7 +88,7 @@ pub struct MapOutput {
 }
 
 /// Draw the map and handle navigation input.
-pub fn map_ui(ui: &mut egui::Ui, cam: &mut Camera, layers: &[Layer], tiles: &mut TileManager) -> MapOutput {
+pub fn map_ui(ui: &mut egui::Ui, cam: &mut Camera, layers: &[Layer], tiles: &mut TileManager, nav: Nav) -> MapOutput {
     let rect = ui.available_rect_before_wrap();
     let resp = ui.allocate_rect(rect, Sense::click_and_drag());
     let painter = ui.painter_at(rect);
@@ -93,7 +103,7 @@ pub fn map_ui(ui: &mut egui::Ui, cam: &mut Camera, layers: &[Layer], tiles: &mut
         .clamp(1e-7, 1.0);
 
     // --- Navigation -------------------------------------------------------
-    if resp.dragged_by(egui::PointerButton::Primary) || resp.dragged_by(egui::PointerButton::Middle) {
+    if (nav.primary_pan && resp.dragged_by(egui::PointerButton::Primary)) || resp.dragged_by(egui::PointerButton::Middle) {
         let d = resp.drag_delta();
         cam.cx -= d.x as f64 * cam.mpp;
         cam.cy += d.y as f64 * cam.mpp;
@@ -108,12 +118,12 @@ pub fn map_ui(ui: &mut egui::Ui, cam: &mut Camera, layers: &[Layer], tiles: &mut
             cam.zoom_at(rect, hover, factor, min_mpp);
         }
     }
-    if resp.double_clicked() {
+    if nav.double_click_zoom && resp.double_clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
             cam.zoom_at(rect, p, 2.0, min_mpp);
         }
     }
-    if resp.hovered() || resp.has_focus() || !ui.ctx().egui_wants_keyboard_input() {
+    if !ui.ctx().egui_wants_keyboard_input() {
         let step = 120.0 * cam.mpp;
         ui.input(|i| {
             if i.key_pressed(egui::Key::ArrowLeft) { cam.cx -= step }
@@ -180,9 +190,8 @@ pub fn map_ui(ui: &mut egui::Ui, cam: &mut Camera, layers: &[Layer], tiles: &mut
     });
     tiles.request(wanted);
 
-    scale_bar(&painter, rect, cam);
-
     MapOutput {
+        resp: resp.clone(),
         hover_lonlat: resp.hover_pos().map(|p| {
             let (x, y) = cam.to_world(rect, p);
             merc_to_lonlat(x, y)
@@ -200,7 +209,7 @@ fn tile_dist(cog: &Cog, k: &TileKey, cx: f64, cy: f64) -> f64 {
 }
 
 /// Ground-distance scale bar, bottom-left.
-fn scale_bar(painter: &egui::Painter, rect: Rect, cam: &Camera) {
+pub fn scale_bar(painter: &egui::Painter, rect: Rect, cam: &Camera) {
     let (_, lat) = merc_to_lonlat(cam.cx, cam.cy);
     let ground_per_pt = cam.mpp * lat.to_radians().cos();
     let target = ground_per_pt * 120.0;

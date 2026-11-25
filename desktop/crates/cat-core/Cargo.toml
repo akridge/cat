@@ -1,0 +1,14 @@
+[package]
+name = "cat-core"
+description = "CAT annotation model: GeoJSON-compatible annotations, species, field options, geometry, undo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+csv = "1"

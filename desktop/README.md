@@ -3,15 +3,26 @@
 Native, portable Windows annotation workstation for CAT. See
 [`docs/rust-desktop-plan.md`](../docs/rust-desktop-plan.md) for the full plan.
 
-**Status: Phase 0 (spike).** A native map viewer that streams orthomosaic
-COGs straight from the public bucket. There is no annotation yet.
+**Status: Phase 1 in progress.** Native map viewer plus local annotation:
+draw/edit points, lines, rectangles and polygons; attribute form with species
+autocomplete; undo/redo; table; autosave to the portable `data\` folder;
+GeoJSON/CSV export. Server sync comes next.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `crates/cat-cog` | Pure-Rust COG reader (no GDAL): TIFF/BigTIFF + GeoTIFF parsing, HTTP range reads with request merging, ZSTD/LZW/DEFLATE decode, background detection, WebMercator placement |
-| `app` | `CAT.exe` — egui/eframe app: map canvas (GPU), bucket browser, layers |
+| `crates/cat-core` | Annotation model (server-compatible GeoJSON properties), form fields and option lists, bundled coral species search, geometry/measurements, undo history, file store and CSV export |
+| `app` | `CAT.exe` — egui/eframe app: map canvas (GPU), editor (tools, snapping, vertex editing), attribute form, table, bucket browser, layers, settings |
+
+## Where data goes
+
+`data\` next to `CAT.exe` (falls back to `%LOCALAPPDATA%\CAT` if not
+writable; override with `CAT_DATA_DIR`):
+
+- `settings.json` — sticky form values, recent species, display options, last session
+- `annotations\<mosaic>.geojson` — one file per mosaic, saved automatically (previous version kept as `.bak`)
 
 ## Build & run
 
@@ -37,5 +48,5 @@ cargo run --release -p cat-cog --bin catcog -- bench    <gs://…tif>   # timing
 
 ## Tests
 
-`cargo test -p cat-cog` runs offline. It builds a synthetic georeferenced
+`cargo test -p cat-cog -p cat-core` runs offline. cat-cog's test It builds a synthetic georeferenced
 tiled TIFF in memory and reads it back through the same code path.

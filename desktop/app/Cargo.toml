@@ -13,9 +13,13 @@ path = "src/main.rs"
 anyhow.workspace = true
 log.workspace = true
 cat-cog = { path = "../crates/cat-cog" }
+cat-core = { path = "../crates/cat-core" }
+earcutr = "0.5"
+rfd = "0.18"
+egui_extras = "0.37"
 eframe = { version = "0.37", features = ["glow"] }
 egui = "0.37"
 lru = "0.19"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "query"] }

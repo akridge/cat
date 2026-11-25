@@ -32,8 +32,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: desktop
-      - name: Unit tests (cat-cog, offline)
-        run: cargo test -p cat-cog --lib --tests
+      - name: Unit tests (cat-cog, cat-core; offline)
+        run: cargo test -p cat-cog -p cat-core --lib --tests
 
   windows:
     name: Build portable CAT.exe
