@@ -203,6 +203,20 @@ impl Annotation {
     }
 }
 
+/// Serialized as a GeoJSON Feature (same as the annotation files).
+impl serde::Serialize for Annotation {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.to_feature().serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Annotation {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = Value::deserialize(d)?;
+        Annotation::from_feature(&v).ok_or_else(|| serde::de::Error::custom("invalid annotation feature"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

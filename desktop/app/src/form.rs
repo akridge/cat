@@ -175,6 +175,13 @@ impl Form {
             return FormAction::None;
         };
         let mut action = FormAction::None;
+        if editor.read_only {
+            ui.colored_label(Color32::from_rgb(230, 180, 0), "👁 View only");
+            ui.disable();
+        }
+        if let Some(by) = a.get("created_by").and_then(|v| v.as_str()) {
+            ui.weak(format!("by {by}"));
+        }
 
         ui.horizontal(|ui| {
             ui.heading(a.kind.label());
@@ -413,4 +420,27 @@ fn same_attributes(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
         m
     };
     strip(a) == strip(b)
+}
+
+impl Form {
+    /// Apply server-configured option lists (team-lead settings).
+    pub fn apply_options(&mut self, lists: &[(String, Vec<(String, String)>)]) {
+        for (name, opts) in lists {
+            let members: Vec<&str> = match name.as_str() {
+                "rdcause" => vec!["rdcause1", "rdcause2", "rdcause3"],
+                "con" => vec!["con_1", "con_2", "con_3"],
+                "sev" => vec!["sev_1", "sev_2", "sev_3"],
+                other => vec![other],
+            };
+            for f in self.fields.iter_mut().filter(|f| members.contains(&f.key)) {
+                if opts.is_empty() {
+                    continue;
+                }
+                f.options = opts.clone();
+                if f.kind == FieldKind::Text {
+                    f.kind = FieldKind::Choice { free: true };
+                }
+            }
+        }
+    }
 }

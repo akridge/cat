@@ -3,10 +3,15 @@
 Native, portable Windows annotation workstation for CAT. See
 [`docs/rust-desktop-plan.md`](../docs/rust-desktop-plan.md) for the full plan.
 
-**Status: Phase 1 in progress.** Native map viewer plus local annotation:
+**Status: Phase 1 in progress.** Native map viewer and annotation editor:
 draw/edit points, lines, rectangles and polygons; attribute form with species
-autocomplete; undo/redo; table; autosave to the portable `data\` folder;
-GeoJSON/CSV export. Server sync comes next.
+autocomplete; undo/redo; table; GeoJSON/CSV export. Works in two modes:
+
+- **Server mode** — sign in to a CAT server (Dev/Prod profiles), open a
+  project, annotations sync to the Oracle database in the background
+  (offline queue, automatic retry, conflict resolution, viewer = read-only).
+- **Local mode** — annotate any bucket mosaic without a server; saved to the
+  portable `data\` folder.
 
 ## Layout
 
@@ -14,6 +19,7 @@ GeoJSON/CSV export. Server sync comes next.
 |---|---|
 | `crates/cat-cog` | Pure-Rust COG reader (no GDAL): TIFF/BigTIFF + GeoTIFF parsing, HTTP range reads with request merging, ZSTD/LZW/DEFLATE decode, background detection, WebMercator placement |
 | `crates/cat-core` | Annotation model (server-compatible GeoJSON properties), form fields and option lists, bundled coral species search, geometry/measurements, undo history, file store and CSV export |
+| `crates/cat-api` | CAT server client (cookie session login, projects, snapshot, batch-sync/delete, species, field options) and the offline-safe sync engine (fingerprints, journal merge, conflicts) |
 | `app` | `CAT.exe` — egui/eframe app: map canvas (GPU), editor (tools, snapping, vertex editing), attribute form, table, bucket browser, layers, settings |
 
 ## Where data goes
@@ -22,7 +28,9 @@ GeoJSON/CSV export. Server sync comes next.
 writable; override with `CAT_DATA_DIR`):
 
 - `settings.json` — sticky form values, recent species, display options, last session
-- `annotations\<mosaic>.geojson` — one file per mosaic, saved automatically (previous version kept as `.bak`)
+- `annotations\<mosaic>.geojson` — local mode: one file per mosaic, saved automatically (previous version kept as `.bak`)
+- `server\<host>\project-<id>.json` — server mode: journal of the project's annotations and sync state, so unsynced work survives crashes and network loss
+- Sign-in sessions are kept in Windows Credential Manager ("CAT desktop"), never in these files.
 
 ## Build & run
 
@@ -50,3 +58,13 @@ cargo run --release -p cat-cog --bin catcog -- bench    <gs://…tif>   # timing
 
 `cargo test -p cat-cog -p cat-core` runs offline. cat-cog's test It builds a synthetic georeferenced
 tiled TIFF in memory and reads it back through the same code path.
+
+## Testing against a real CAT server
+
+See [`DEV-SERVER.md`](DEV-SERVER.md) to run Oracle Free + the CAT server
+locally, then:
+
+```bash
+CAT_TEST_SERVER=http://127.0.0.1:8000 CAT_TEST_USER=admin CAT_TEST_PASSWORD=… \
+  cargo test -p cat-api --test live_server
+```

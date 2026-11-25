@@ -5,6 +5,7 @@ mod catalog;
 mod editor;
 mod form;
 mod map;
+mod server;
 mod settings;
 mod table;
 mod tiles;
@@ -18,6 +19,7 @@ use editor::{Editor, Tool};
 use egui::{Color32, RichText};
 use form::{Form, FormAction};
 use map::{Camera, Nav};
+use server::{Server, ServerProfile, SyncStatus};
 use settings::{data_dir, Settings};
 use tiles::{Layer, LayerState, TileManager};
 
@@ -105,6 +107,26 @@ struct CatApp {
     /// Last settings written, to persist only when something changed.
     persisted: String,
     persist_check: Instant,
+
+    server: Server,
+    login: LoginForm,
+    show_login: bool,
+    show_conflicts: bool,
+    project_query: String,
+    /// Editor revision last considered for sync, and when it changed.
+    sync_rev: u64,
+    pending_sync: usize,
+}
+
+#[derive(Default)]
+struct LoginForm {
+    profile: Option<usize>,
+    name: String,
+    url: String,
+    username: String,
+    password: String,
+    remember: bool,
+    error: Option<String>,
 }
 
 fn annotations_path(uri: &str) -> PathBuf {
@@ -149,8 +171,24 @@ impl CatApp {
             save_state: SaveState::Saved,
             persisted: String::new(),
             persist_check: Instant::now(),
+            server: Server::new(ctx),
+            login: LoginForm { remember: true, ..Default::default() },
+            show_login: false,
+            show_conflicts: false,
+            project_query: String::new(),
+            sync_rev: 0,
+            pending_sync: 0,
         };
-        if initial.is_empty() {
+        // Resume the last server session (token kept in Windows Credential Manager).
+        if let Some(p) = app.settings.server.and_then(|i| app.settings.servers.get(i)).cloned() {
+            app.server.resume(p);
+        }
+        if initial.is_empty() && app.settings.last_project.is_some() && app.settings.server.is_some() {
+            // The server project reopens after sign-in resumes.
+            if let Some(v) = app.settings.last_view {
+                app.restore_view = Some(v);
+            }
+        } else if initial.is_empty() {
             // Pick up where the user left off.
             let last = app.settings.last_layers.clone();
             for (i, uri) in last.into_iter().enumerate() {
@@ -174,6 +212,7 @@ impl CatApp {
 
     fn open_layer(&mut self, uri: String, replace: bool) {
         if replace {
+            self.close_project();
             self.save_now();
             for l in self.layers.drain(..) {
                 self.tiles.forget_layer(l.id);
@@ -190,7 +229,7 @@ impl CatApp {
         self.tiles.open(id, uri.clone());
         self.layers.push(Layer { id, name, uri: uri.clone(), state: LayerState::Opening, visible: true, opacity: 1.0 });
         self.fit_pending = Some(id);
-        if self.active.is_none() {
+        if self.active.is_none() && self.server.open.is_none() {
             self.activate(id);
         }
     }
@@ -225,10 +264,21 @@ impl CatApp {
     }
 
     fn save_now(&mut self) {
-        let Some((id, path)) = self.active.clone() else { return };
         if self.editor.rev == self.saved_rev {
             return;
         }
+        if let Some(open) = &self.server.open {
+            // Server project: the journal keeps unsynced work safe on disk.
+            match server::write_journal(&open.journal, &self.editor.items, &open.sync) {
+                Ok(()) => {
+                    self.saved_rev = self.editor.rev;
+                    self.save_state = SaveState::Saved;
+                }
+                Err(e) => self.save_state = SaveState::Failed(e.to_string()),
+            }
+            return;
+        }
+        let Some((id, path)) = self.active.clone() else { return };
         let uri = self.layers.iter().find(|l| l.id == id).map(|l| l.uri.clone()).unwrap_or_default();
         let meta = serde_json::json!({"cog": uri, "app": format!("cat-desktop {}", env!("CARGO_PKG_VERSION")), "saved_at": cat_core::annotation::now_iso()});
         match store::save_geojson(&path, &self.editor.items, meta) {
@@ -251,6 +301,132 @@ impl CatApp {
             // Save shortly after the last change, and never wait more than 10 s.
             if self.last_change.elapsed() > Duration::from_millis(800) && !self.editor.is_drawing() {
                 self.save_now();
+            }
+        }
+    }
+
+    /// Save and leave the open server project (back to local mode).
+    fn close_project(&mut self) {
+        if self.server.open.is_some() {
+            self.form.commit(&mut self.editor);
+            self.save_now();
+            if let Some(o) = &self.server.open {
+                let _ = server::write_journal(&o.journal, &self.editor.items, &o.sync);
+            }
+            self.server.open = None;
+            self.settings.last_project = None;
+            self.editor.read_only = false;
+            self.editor.load(Vec::new());
+            self.saved_rev = self.editor.rev;
+        }
+    }
+
+    fn on_project_loaded(&mut self, snap: cat_api::Snapshot) {
+        self.form.commit(&mut self.editor);
+        self.save_now();
+        self.close_project();
+        for l in self.layers.drain(..) {
+            self.tiles.forget_layer(l.id);
+        }
+        self.active = None;
+        let base = self.server.client.as_ref().map(|c| c.base().to_string()).unwrap_or_default();
+        let journal = server::journal_path(&base, snap.project.project_id);
+        let (items, sync, kept) = cat_api::sync::merge_snapshot(&snap.annotations, server::read_journal(&journal));
+        let can_edit = snap.can_edit();
+        let mut skipped = Vec::new();
+        let assets: Vec<cat_api::Asset> = snap.assets.iter().filter(|a| a.is_active.unwrap_or(1) != 0).cloned().collect();
+        self.server.open = Some(server::OpenProject {
+            project: snap.project.clone(),
+            can_edit,
+            role: snap.my_role.clone(),
+            asset_id: assets.first().map(|a| a.asset_id),
+            sync,
+            journal,
+        });
+        for a in &assets {
+            let u = a.cog_url.trim();
+            if u.starts_with("gs://") || u.starts_with("/vsigs/") || u.starts_with("http://") || u.starts_with("https://") {
+                self.open_layer(u.to_string(), false);
+            } else {
+                skipped.push(a.asset_name.clone());
+            }
+        }
+        if !skipped.is_empty() {
+            self.errors.push(format!("These project images are stored on the server's own disk, not in the bucket, so the desktop can't show them: {}", skipped.join(", ")));
+        }
+        self.editor.read_only = !can_edit;
+        self.editor.load(items);
+        self.saved_rev = self.editor.rev;
+        self.sync_rev = 0;
+        if let Some(site) = snap.project.site.clone().filter(|s| !s.is_empty()) {
+            self.settings.sticky.insert("site".into(), serde_json::json!(site.to_uppercase()));
+        }
+        if let Some(y) = snap.project.year {
+            self.settings.sticky.insert("obs_year".into(), serde_json::json!(y));
+        }
+        self.editor.new_props = self.settings.sticky.clone();
+        self.editor.timer_mark = self.timer.secs;
+        self.settings.last_project = Some(snap.project.project_id);
+        if kept > 0 {
+            self.editor.toast = Some((format!("Recovered {kept} unsynced change(s) from last session — syncing now"), Instant::now()));
+        } else if !can_edit {
+            self.editor.toast = Some(("View only — your role on this project is viewer".into(), Instant::now()));
+        }
+    }
+
+    fn handle_server_events(&mut self) {
+        for ev in self.server.poll() {
+            match ev {
+                server::Event::SignedIn => {
+                    self.show_login = false;
+                    self.login.password.clear();
+                    self.login.error = None;
+                    let scope = self.settings.project_scope.clone();
+                    self.server.refresh_projects("", &scope);
+                    if !self.settings.sticky.contains_key("analyst") {
+                        if let Some(u) = &self.server.user {
+                            self.settings.sticky.insert("analyst".into(), serde_json::json!(u.name().to_uppercase()));
+                            self.editor.new_props = self.settings.sticky.clone();
+                        }
+                    }
+                    if let Some(pid) = self.settings.last_project {
+                        if self.server.open.is_none() && self.server.loading_project.is_none() {
+                            self.server.load_project(pid);
+                        }
+                    }
+                }
+                server::Event::SignedOut(msg) => {
+                    if !msg.is_empty() {
+                        self.login.error = Some(msg);
+                        self.show_login = true;
+                    }
+                }
+                server::Event::ProjectLoaded(snap) => self.on_project_loaded(*snap),
+                server::Event::ProjectFailed(e) => self.errors.push(format!("Could not open project: {e}")),
+                server::Event::SpeciesUpdated(list) => self.form.species = cat_core::species::SpeciesList { items: list },
+                server::Event::OptionsUpdated(o) => self.form.apply_options(&o),
+                server::Event::Conflicts(n) => {
+                    self.show_conflicts = true;
+                    self.editor.toast = Some((format!("{n} annotation(s) were changed by someone else — choose which version to keep"), Instant::now()));
+                }
+            }
+        }
+    }
+
+    /// Kick off a sync round when local work differs from the server.
+    fn drive_sync(&mut self) {
+        let Some(open) = &self.server.open else { return };
+        if self.editor.rev != self.sync_rev {
+            self.pending_sync = open.sync.pending(&self.editor.items);
+        }
+        let quiet = self.last_change.elapsed() > Duration::from_millis(700) && !self.editor.is_drawing();
+        let retry_due = matches!(&self.server.status, SyncStatus::Offline { retry_at, .. } if Instant::now() >= *retry_at);
+        if (quiet && self.editor.rev != self.sync_rev) || retry_due || (self.pending_sync > 0 && self.server.status == SyncStatus::Idle && quiet) {
+            self.sync_rev = self.editor.rev;
+            let analyst = self.settings.sticky.get("analyst").and_then(|v| v.as_str()).map(str::to_string);
+            self.server.maybe_sync(&self.editor.items, analyst);
+            if let Some(open) = &self.server.open {
+                self.pending_sync = open.sync.pending(&self.editor.items);
             }
         }
     }
@@ -418,16 +594,278 @@ impl CatApp {
                 ui.label(format!("CAT desktop {}", env!("CARGO_PKG_VERSION")));
                 ui.weak(format!("Data folder: {}", data_dir().display()));
             });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.server_badge(ui));
+        });
+    }
+
+    fn server_badge(&mut self, ui: &mut egui::Ui) {
+        let (text, bg, tip) = match (&self.server.user, &self.server.profile) {
+            (Some(u), Some(p)) => (
+                format!(" ● {} · {} ", p.name.to_uppercase(), u.name()),
+                if p.is_prod() { Color32::from_rgb(190, 40, 40) } else { Color32::from_rgb(40, 110, 160) },
+                format!("Signed in to {} as {} ({})", p.url, u.username, u.role),
+            ),
+            _ if self.server.signing_in => (" Signing in… ".into(), Color32::from_rgb(90, 90, 90), String::new()),
+            _ => (" Local mode · Sign in to CAT server ".into(), Color32::from_rgb(70, 70, 70), "Annotations are saved in the data folder next to CAT.exe. Sign in to annotate server projects (saved to the CAT database).".into()),
+        };
+        let r = ui.add(egui::Button::new(RichText::new(text).color(Color32::WHITE)).fill(bg)).on_hover_text(tip);
+        if self.server.connected() {
+            let mut sign_out = false;
+            egui::Popup::menu(&r).show(|ui| {
+                if let Some(o) = &self.server.open {
+                    ui.weak(format!("Your role on {}: {}", o.project.project_name, o.role));
+                    ui.separator();
+                }
+                if ui.button("Switch server / account…").clicked() {
+                    self.show_login = true;
+                }
+                if ui.button("Sign out").clicked() {
+                    sign_out = true;
+                }
+            });
+            if sign_out {
+                self.close_project();
+                self.server.sign_out();
+                self.settings.server = None;
+            }
+        } else if r.clicked() {
+            self.show_login = true;
+        }
+    }
+
+    fn projects_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Projects");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new(" Local mode · not connected to a CAT server ").color(Color32::WHITE).background_color(Color32::from_rgb(40, 110, 160)))
-                    .on_hover_text("Annotations are saved in the data folder next to CAT.exe. Server sync arrives with the CAT server connection.");
+                if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                    let (q, sc) = (self.project_query.clone(), self.settings.project_scope.clone());
+                    self.server.refresh_projects(&q, &sc);
+                }
+                let mut changed = false;
+                changed |= ui.selectable_value(&mut self.settings.project_scope, "all".to_string(), "All").clicked();
+                changed |= ui.selectable_value(&mut self.settings.project_scope, "mine".to_string(), "Mine").clicked();
+                if changed {
+                    let (q, sc) = (self.project_query.clone(), self.settings.project_scope.clone());
+                    self.server.refresh_projects(&q, &sc);
+                }
             });
         });
+        let r = ui.add(egui::TextEdit::singleline(&mut self.project_query).hint_text("🔍 search projects").desired_width(f32::INFINITY));
+        if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) || (r.changed() && self.project_query.is_empty()) {
+            let (q, sc) = (self.project_query.clone(), self.settings.project_scope.clone());
+            self.server.refresh_projects(&q, &sc);
+        }
+        if self.server.projects_loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Loading projects…");
+            });
+        }
+        if let Some(e) = &self.server.project_error {
+            ui.colored_label(Color32::from_rgb(220, 80, 60), e);
+        }
+        let open_id = self.server.open.as_ref().map(|o| o.project.project_id);
+        let mut load = None;
+        egui::ScrollArea::vertical().id_salt("projects").max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
+            for p in &self.server.projects {
+                let sub = [p.site.clone().unwrap_or_default(), p.year.map(|y| y.to_string()).unwrap_or_default(), p.region.clone().unwrap_or_default()]
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let loading = self.server.loading_project == Some(p.project_id);
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(open_id == Some(p.project_id), RichText::new(&p.project_name).strong()).on_hover_text(&sub).clicked() {
+                        load = Some(p.project_id);
+                    }
+                    if loading {
+                        ui.spinner();
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak(sub);
+                    });
+                });
+            }
+            if self.server.projects.is_empty() && !self.server.projects_loading {
+                ui.weak("No projects. Try 'All', or create one in the CAT web app.");
+            }
+        });
+        if let Some(id) = load {
+            if open_id != Some(id) {
+                self.form.commit(&mut self.editor);
+                self.save_now();
+                self.server.load_project(id);
+            }
+        }
+        ui.separator();
+    }
+
+    fn login_window(&mut self, ctx: &egui::Context) {
+        if !self.show_login {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        egui::Window::new("Sign in to a CAT server").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+            let servers = self.settings.servers.clone();
+            ui.horizontal(|ui| {
+                ui.label("Server");
+                egui::ComboBox::from_id_salt("server-profile")
+                    .selected_text(self.login.profile.and_then(|i| servers.get(i)).map(|p| p.name.clone()).unwrap_or_else(|| "New server…".into()))
+                    .show_ui(ui, |ui| {
+                        for (i, p) in servers.iter().enumerate() {
+                            if ui.selectable_label(self.login.profile == Some(i), format!("{}  ({})", p.name, p.url)).clicked() {
+                                self.login.profile = Some(i);
+                                self.login.name = p.name.clone();
+                                self.login.url = p.url.clone();
+                                self.login.username = p.username.clone();
+                            }
+                        }
+                        if ui.selectable_label(self.login.profile.is_none(), "New server…").clicked() {
+                            self.login.profile = None;
+                            self.login.name.clear();
+                            self.login.url.clear();
+                        }
+                    });
+            });
+            egui::Grid::new("login").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                ui.label("Name");
+                ui.add(egui::TextEdit::singleline(&mut self.login.name).hint_text("e.g. Dev or Prod"));
+                ui.end_row();
+                ui.label("URL");
+                ui.add(egui::TextEdit::singleline(&mut self.login.url).hint_text("https://cat.example.gov").desired_width(280.0));
+                ui.end_row();
+                ui.label("Username");
+                ui.text_edit_singleline(&mut self.login.username);
+                ui.end_row();
+                ui.label("Password");
+                let r = ui.add(egui::TextEdit::singleline(&mut self.login.password).password(true));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                ui.end_row();
+            });
+            ui.checkbox(&mut self.login.remember, "Keep me signed in on this computer").on_hover_text("The session is stored in Windows Credential Manager, never in a file.");
+            if self.login.name.to_lowercase().contains("prod") {
+                ui.colored_label(Color32::from_rgb(220, 80, 60), "⚠ Production server — edits go to the live database.");
+            }
+            if let Some(e) = &self.login.error {
+                ui.colored_label(Color32::from_rgb(220, 80, 60), e);
+            }
+            ui.horizontal(|ui| {
+                let ready = !self.login.url.trim().is_empty() && !self.login.username.trim().is_empty() && !self.login.password.is_empty();
+                if ui.add_enabled(ready && !self.server.signing_in, egui::Button::new("Sign in")).clicked() {
+                    submit = true;
+                }
+                if self.server.signing_in {
+                    ui.spinner();
+                }
+            });
+        });
+        if !open {
+            self.show_login = false;
+        }
+        if submit && !self.server.signing_in {
+            let mut url = self.login.url.trim().trim_end_matches('/').to_string();
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                url = format!("https://{url}");
+            }
+            let name = if self.login.name.trim().is_empty() { url.trim_start_matches("https://").trim_start_matches("http://").to_string() } else { self.login.name.trim().to_string() };
+            let profile = ServerProfile { name, url, username: self.login.username.trim().to_string() };
+            let idx = match self.settings.servers.iter().position(|p| p.url == profile.url && p.name == profile.name) {
+                Some(i) => {
+                    self.settings.servers[i] = profile.clone();
+                    i
+                }
+                None => {
+                    self.settings.servers.push(profile.clone());
+                    self.settings.servers.len() - 1
+                }
+            };
+            self.settings.server = Some(idx);
+            self.login.profile = Some(idx);
+            self.login.error = None;
+            self.close_project();
+            let pw = std::mem::take(&mut self.login.password);
+            self.server.sign_in(profile, pw, self.login.remember);
+        }
+    }
+
+    fn conflicts_window(&mut self, ctx: &egui::Context) {
+        let n = self.server.open.as_ref().map(|o| o.sync.conflicts.len()).unwrap_or(0);
+        if n == 0 {
+            self.show_conflicts = false;
+            return;
+        }
+        if !self.show_conflicts {
+            return;
+        }
+        let mut open = true;
+        let mut actions: Vec<(String, bool)> = Vec::new();
+        egui::Window::new(format!("⚠ {n} annotation(s) changed by someone else"))
+            .open(&mut open)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 90.0])
+            .show(ctx, |ui| {
+            ui.label("While you were editing, another user changed or deleted these annotations on the server. Choose which version to keep.");
+            ui.separator();
+            let conflicts: Vec<(String, cat_api::sync::Conflict)> = self.server.open.as_ref().map(|o| o.sync.conflicts.clone().into_iter().collect()).unwrap_or_default();
+            egui::Grid::new("conflicts").striped(true).num_columns(4).show(ui, |ui| {
+                for (uuid, c) in &conflicts {
+                    let mine = self.editor.get(uuid).map(|a| format!("{} {}", a.kind.label(), a.spcode())).unwrap_or_else(|| "(deleted here)".into());
+                    let theirs = match c.kind {
+                        cat_api::sync::ConflictKind::Deleted => "deleted on server".to_string(),
+                        cat_api::sync::ConflictKind::Changed => c.server.as_ref().map(|a| format!("{} {}", a.kind.label(), a.spcode())).unwrap_or_else(|| "changed".into()),
+                    };
+                    if ui.link(&mine).on_hover_text("Show on map").clicked() {
+                        self.editor.selected = Some(uuid.clone());
+                    }
+                    ui.label(format!("server: {theirs}"));
+                    if ui.button("Keep mine").clicked() {
+                        actions.push((uuid.clone(), true));
+                    }
+                    if ui.button("Use server's").clicked() {
+                        actions.push((uuid.clone(), false));
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Keep all mine").clicked() {
+                    actions.extend(conflicts.iter().map(|c| (c.0.clone(), true)));
+                }
+                if ui.button("Use all server versions").clicked() {
+                    actions.extend(conflicts.iter().map(|c| (c.0.clone(), false)));
+                }
+            });
+        });
+        if !open {
+            self.show_conflicts = false;
+        }
+        for (uuid, keep_mine) in actions {
+            let Some(o) = self.server.open.as_mut() else { break };
+            if keep_mine {
+                if let Some(new_uuid) = o.sync.keep_mine(&uuid) {
+                    if let Some(a) = self.editor.get_mut(&uuid) {
+                        a.uuid = new_uuid;
+                    }
+                }
+            } else {
+                let replacement = o.sync.use_server(&uuid);
+                cat_core::history::apply(&mut self.editor.items, &uuid, replacement.as_ref());
+                self.editor.history.clear();
+            }
+            self.editor.rev += 1;
+        }
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.add_space(4.0);
+        if self.server.connected() {
+            self.projects_panel(ui);
+        }
         ui.heading("Layers");
         if self.layers.is_empty() {
             ui.weak("Pick an orthomosaic below.");
@@ -449,7 +887,8 @@ impl CatApp {
                     LayerState::Ready(_) => {}
                 }
                 let is_active = active_id == Some(l.id);
-                if ui.selectable_label(is_active, &l.name).on_hover_text(format!("{}\nClick to annotate this mosaic", l.uri)).clicked() && !is_active {
+                let in_project = self.server.open.is_some();
+                if ui.selectable_label(is_active || in_project, &l.name).on_hover_text(format!("{}\nClick to annotate this mosaic", l.uri)).clicked() && !is_active && !in_project {
                     activate = Some(l.id);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -486,7 +925,7 @@ impl CatApp {
         }
 
         ui.separator();
-        ui.heading("Orthomosaics");
+        ui.heading(if self.server.connected() { "Bucket mosaics (local annotation)" } else { "Orthomosaics" });
         ui.weak(format!("gs://{}/…/orthomosaic_cog/", catalog::BUCKET));
         ui.horizontal(|ui| {
             let years = self.catalog.years.clone();
@@ -540,11 +979,57 @@ impl CatApp {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            match &self.save_state {
-                SaveState::Saved => ui.label(RichText::new("✔ Saved").color(Color32::from_rgb(90, 200, 110))),
-                SaveState::Pending => ui.label(RichText::new("● Saving…").color(Color32::from_rgb(230, 180, 0))),
-                SaveState::Failed(e) => ui.label(RichText::new("⚠ Not saved").color(Color32::from_rgb(230, 80, 60))).on_hover_text(e.as_str()),
-            };
+            let green = Color32::from_rgb(90, 200, 110);
+            let amber = Color32::from_rgb(230, 180, 0);
+            let red = Color32::from_rgb(230, 80, 60);
+            if let Some(open) = &self.server.open {
+                let conflicts = open.sync.conflicts.len();
+                let failed = open.sync.failed.len();
+                let failed_detail = open.sync.failed.values().take(5).cloned().collect::<Vec<_>>().join("\n");
+                let can_edit = open.can_edit;
+                let status = self.server.status.clone();
+                let mut retry = false;
+                match &status {
+                    _ if !can_edit => {
+                        ui.label(RichText::new("👁 View only").color(amber));
+                    }
+                    SyncStatus::Syncing(n) => {
+                        ui.spinner();
+                        ui.label(RichText::new(format!("Syncing {n}…")).color(amber));
+                    }
+                    SyncStatus::Offline { queued, retry_at, error } => {
+                        let secs = retry_at.saturating_duration_since(Instant::now()).as_secs();
+                        ui.label(RichText::new(format!("⚠ Offline · {} queued · retry in {secs}s", self.pending_sync.max(*queued))).color(red))
+                            .on_hover_text(format!("{error}\nYour work is safe on this computer and will sync automatically."));
+                        retry |= ui.small_button("Retry now").clicked();
+                        ctx_repaint(ui, 1000);
+                    }
+                    SyncStatus::Idle if self.pending_sync > 0 => {
+                        ui.label(RichText::new(format!("● {} to sync", self.pending_sync)).color(amber));
+                    }
+                    SyncStatus::Idle => {
+                        ui.label(RichText::new("☁ Synced").color(green)).on_hover_text("All annotations are saved in the CAT database");
+                    }
+                }
+                if conflicts > 0 && ui.button(RichText::new(format!("⚠ {conflicts} conflict(s)")).color(red)).clicked() {
+                    self.show_conflicts = true;
+                }
+                if failed > 0 {
+                    retry |= ui
+                        .button(RichText::new(format!("⚠ {failed} rejected")).color(red))
+                        .on_hover_text(format!("The server refused these:\n{failed_detail}\nClick to retry."))
+                        .clicked();
+                }
+                if retry {
+                    self.server.retry_now();
+                }
+            } else {
+                match &self.save_state {
+                    SaveState::Saved => ui.label(RichText::new("✔ Saved").color(green)),
+                    SaveState::Pending => ui.label(RichText::new("● Saving…").color(amber)),
+                    SaveState::Failed(e) => ui.label(RichText::new("⚠ Not saved").color(red)).on_hover_text(e.as_str()),
+                };
+            }
             ui.separator();
             ui.label(format!("⏱ {}", fmt_duration(self.timer.secs))).on_hover_text("Active annotation time this session (pauses after 2 min idle)");
             ui.separator();
@@ -554,7 +1039,7 @@ impl CatApp {
             };
             ui.separator();
             if let Some((lvl, ratio)) = self.level {
-                let pct = 100.0 / ratio.max(1e-12);
+                let pct = 100.0 * ratio;
                 let z = if pct < 10.0 { format!("{pct:.1}%") } else { format!("{pct:.0}%") };
                 ui.label(format!("zoom {z} · level {lvl}")).on_hover_text("100% = one full-resolution image pixel per screen pixel");
                 ui.separator();
@@ -697,7 +1182,10 @@ impl CatApp {
     }
 
     fn update_title(&self, ctx: &egui::Context) {
-        let name = self.active.as_ref().and_then(|(id, _)| self.layers.iter().find(|l| l.id == *id)).map(|l| l.name.clone());
+        let name = match &self.server.open {
+            Some(o) => Some(format!("{} [{}]", o.project.project_name, self.server.profile.as_ref().map(|p| p.name.as_str()).unwrap_or("server"))),
+            None => self.active.as_ref().and_then(|(id, _)| self.layers.iter().find(|l| l.id == *id)).map(|l| l.name.clone()),
+        };
         let dirty = if self.editor.rev != self.saved_rev { " •" } else { "" };
         let title = match name {
             Some(n) => format!("CAT — {n}{dirty}"),
@@ -753,6 +1241,7 @@ impl eframe::App for CatApp {
                 self.fit_pending = None;
             }
         }
+        self.handle_server_events();
         self.shortcuts(&ctx);
 
         egui::Panel::top("top").show(ui, |ui| self.top_bar(ui));
@@ -828,7 +1317,16 @@ impl eframe::App for CatApp {
             }
         }
         self.shortcuts_window(&ctx);
+        self.login_window(&ctx);
+        self.conflicts_window(&ctx);
         self.autosave();
+        self.drive_sync();
+        if self.server.round_done {
+            self.server.round_done = false;
+            if let Some(o) = &self.server.open {
+                let _ = server::write_journal(&o.journal, &self.editor.items, &o.sync);
+            }
+        }
         if self.save_state == SaveState::Pending {
             ctx.request_repaint_after(Duration::from_millis(300));
         }
@@ -845,4 +1343,8 @@ impl eframe::App for CatApp {
         self.save_now();
         self.persist();
     }
+}
+
+fn ctx_repaint(ui: &egui::Ui, ms: u64) {
+    ui.ctx().request_repaint_after(Duration::from_millis(ms));
 }

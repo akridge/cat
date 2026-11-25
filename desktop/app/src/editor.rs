@@ -102,6 +102,8 @@ pub struct Editor {
     /// Active-time seconds at the last finished annotation (per-annotation timing).
     pub timer_mark: f64,
     pub toast: Option<(String, Instant)>,
+    /// Viewer role on a server project: look, select, but don't change.
+    pub read_only: bool,
     drawing: Vec<[f64; 2]>,
     drag: Option<Drag>,
     tri_cache: HashMap<String, (u64, Vec<u32>)>,
@@ -147,6 +149,7 @@ impl Editor {
             new_props: Map::new(),
             timer_mark: 0.0,
             toast: None,
+            read_only: false,
             drawing: Vec::new(),
             drag: None,
             tri_cache: HashMap::new(),
@@ -154,8 +157,11 @@ impl Editor {
         }
     }
 
-    /// Replace the annotation set (opening another mosaic).
+    /// Replace the annotation set (opening another mosaic or project).
     pub fn load(&mut self, items: Vec<Annotation>) {
+        if self.read_only {
+            self.tool = Tool::Select;
+        }
         self.items = items;
         self.history.clear();
         self.selected = None;
@@ -180,6 +186,10 @@ impl Editor {
     }
 
     pub fn set_tool(&mut self, t: Tool) {
+        if self.read_only && t != Tool::Select {
+            self.toast("View only — you can't edit this project");
+            return;
+        }
         if t != self.tool {
             self.drawing.clear();
             self.drag = None;
@@ -220,6 +230,9 @@ impl Editor {
     }
 
     pub fn delete_selected(&mut self) {
+        if self.read_only {
+            return;
+        }
         if let Some(a) = self.selected_ann().cloned() {
             self.commit("Delete annotation", vec![Change { before: Some(a), after: None }]);
             self.selected = None;
@@ -347,6 +360,9 @@ impl Editor {
     }
 
     fn start_select_drag(&mut self, cam: &Camera, rect: Rect, o: Pos2) {
+        if self.read_only {
+            return;
+        }
         let Some(sel) = self.selected_ann().cloned() else { return };
         let pts = Self::screen_pts(cam, rect, &sel);
         if let Some(idx) = pts.iter().position(|p| p.distance(o) <= HANDLE + 2.0) {
@@ -540,6 +556,9 @@ impl Editor {
     }
 
     fn alt_click_vertex(&mut self, cam: &Camera, rect: Rect, h: Pos2) {
+        if self.read_only {
+            return;
+        }
         let Some(sel) = self.selected_ann().cloned() else { return };
         let pts = Self::screen_pts(cam, rect, &sel);
         if let Some(idx) = pts.iter().position(|p| p.distance(h) <= HANDLE + 2.0) {

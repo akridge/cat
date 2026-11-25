@@ -51,6 +51,12 @@ pub struct Settings {
     pub last_layers: Vec<String>,
     pub last_view: Option<[f64; 3]>,
     pub hide_background: bool,
+    /// CAT server profiles (e.g. Dev and Prod) and the one last used.
+    pub servers: Vec<crate::server::ServerProfile>,
+    pub server: Option<usize>,
+    /// Server project open at exit, reopened on start.
+    pub last_project: Option<i64>,
+    pub project_scope: String,
 }
 
 impl Default for Settings {
@@ -66,6 +72,10 @@ impl Default for Settings {
             last_layers: Vec::new(),
             last_view: None,
             hide_background: true,
+            servers: Vec::new(),
+            server: None,
+            last_project: None,
+            project_scope: "mine".into(),
         }
     }
 }

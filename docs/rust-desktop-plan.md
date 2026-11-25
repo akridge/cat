@@ -29,6 +29,27 @@ Status: proposal (rev 3) · Scope: a **native Rust, portable Windows** annotatio
 - **Design change from the survey:** the app draws each COG internal tile as a GPU-textured quad instead of resampling into WebMercator tiles on the CPU. That gives pixel-exact display at any zoom, and UTM support (proj4rs) is deferred until a non-4326 COG appears.
 - **Timings from a cloud container behind a proxy:** headers 0.3–0.6 s; coarse overview 0.15 s; a 1920×1080 view at full resolution (15 tiles) 0.55 s. These still need measuring on agency Windows laptops.
 
+**Phase 1 — core annotation, largely done** (`desktop/crates/cat-core`, `cat-api`, `app`)
+- **Editor:**
+  - Point, line, rectangle and polygon tools; select; vertex drag/insert/remove; move.
+  - Snapping to vertices, live area/length while drawing, undo/redo for every edit, species labels.
+- **Attribute form:**
+  - Same fields and value types as the web form.
+  - Keyboard-first species autocomplete (type → Enter → Enter).
+  - Sticky survey fields; year and site come from the mosaic or project.
+  - "Same as last" and recent species.
+- **Table:** sort, filter, click to zoom; complete / needs-species counts.
+- **Server mode against the unchanged CAT server**, tested end to end with Oracle Free:
+  - Cookie-session sign-in with Dev/Prod profiles; the session is kept in Windows Credential Manager.
+  - Project list; opening a project loads its bucket COG assets and annotations.
+  - Background sync through `batch-sync`/`batch-delete`.
+  - Offline queue with automatic retry.
+  - A crash-safe journal, merged with the server state on reopen.
+  - Conflict detection with Keep mine / Use server's.
+  - Viewer role is read-only.
+- **Local mode:** annotate any bucket mosaic without a server; autosave to the portable `data\` folder.
+- GeoJSON/CSV export; the last session is restored on start.
+
 ## TL;DR
 
 - **One small `CAT.exe` (≈15–25 MB), fully native.** It uses egui with a GPU map canvas (wgpu → DirectX 12). No webview, no runtime to install, no DLLs to ship.
