@@ -127,6 +127,8 @@ struct LoginForm {
     password: String,
     remember: bool,
     error: Option<String>,
+    /// Profile being signed in to; saved to settings only on success.
+    pending: Option<ServerProfile>,
 }
 
 fn annotations_path(uri: &str) -> PathBuf {
@@ -378,6 +380,20 @@ impl CatApp {
         for ev in self.server.poll() {
             match ev {
                 server::Event::SignedIn => {
+                    if let Some(profile) = self.login.pending.take() {
+                        let idx = match self.settings.servers.iter().position(|p| p.url == profile.url && p.name == profile.name) {
+                            Some(i) => {
+                                self.settings.servers[i] = profile;
+                                i
+                            }
+                            None => {
+                                self.settings.servers.push(profile);
+                                self.settings.servers.len() - 1
+                            }
+                        };
+                        self.settings.server = Some(idx);
+                        self.login.profile = Some(idx);
+                    }
                     self.show_login = false;
                     self.login.password.clear();
                     self.login.error = None;
@@ -704,8 +720,19 @@ impl CatApp {
         if !self.show_login {
             return;
         }
+        // Pre-fill from the last-used server profile.
+        if self.login.profile.is_none() && self.login.url.is_empty() {
+            let idx = self.settings.server.or(if self.settings.servers.is_empty() { None } else { Some(0) });
+            if let Some((i, p)) = idx.and_then(|i| self.settings.servers.get(i).map(|p| (i, p.clone()))) {
+                self.login.profile = Some(i);
+                self.login.name = p.name;
+                self.login.url = p.url;
+                self.login.username = p.username;
+            }
+        }
         let mut open = true;
         let mut submit = false;
+        let ready = !self.login.url.trim().is_empty() && !self.login.username.trim().is_empty() && !self.login.password.is_empty();
         egui::Window::new("Sign in to a CAT server").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
             let servers = self.settings.servers.clone();
             ui.horizontal(|ui| {
@@ -740,7 +767,7 @@ impl CatApp {
                 ui.end_row();
                 ui.label("Password");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.login.password).password(true));
-                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && ready {
                     submit = true;
                 }
                 ui.end_row();
@@ -753,7 +780,6 @@ impl CatApp {
                 ui.colored_label(Color32::from_rgb(220, 80, 60), e);
             }
             ui.horizontal(|ui| {
-                let ready = !self.login.url.trim().is_empty() && !self.login.username.trim().is_empty() && !self.login.password.is_empty();
                 if ui.add_enabled(ready && !self.server.signing_in, egui::Button::new("Sign in")).clicked() {
                     submit = true;
                 }
@@ -772,18 +798,7 @@ impl CatApp {
             }
             let name = if self.login.name.trim().is_empty() { url.trim_start_matches("https://").trim_start_matches("http://").to_string() } else { self.login.name.trim().to_string() };
             let profile = ServerProfile { name, url, username: self.login.username.trim().to_string() };
-            let idx = match self.settings.servers.iter().position(|p| p.url == profile.url && p.name == profile.name) {
-                Some(i) => {
-                    self.settings.servers[i] = profile.clone();
-                    i
-                }
-                None => {
-                    self.settings.servers.push(profile.clone());
-                    self.settings.servers.len() - 1
-                }
-            };
-            self.settings.server = Some(idx);
-            self.login.profile = Some(idx);
+            self.login.pending = Some(profile.clone());
             self.login.error = None;
             self.close_project();
             let pw = std::mem::take(&mut self.login.password);
@@ -1131,6 +1146,9 @@ impl CatApp {
             if i.key_pressed(egui::Key::S) {
                 self.editor.snap = !self.editor.snap;
             }
+            if i.key_pressed(egui::Key::N) {
+                self.fit_pending = Some(u64::MAX - 1);
+            }
             if i.key_pressed(egui::Key::T) {
                 self.settings.show_table = !self.settings.show_table;
             }
@@ -1144,6 +1162,15 @@ impl CatApp {
                 self.show_shortcuts = !self.show_shortcuts;
             }
         });
+        if self.fit_pending == Some(u64::MAX - 1) {
+            self.fit_pending = None;
+            self.form.commit(&mut self.editor);
+            if let Some(b) = self.editor.next_incomplete() {
+                self.zoom_to_bbox(b);
+                self.settings.show_form = true;
+                self.form.focus_species();
+            }
+        }
         if self.fit_pending == Some(u64::MAX) {
             self.fit_pending = None;
             self.fit_all();
@@ -1161,6 +1188,10 @@ impl CatApp {
                     ("Esc", "Cancel drawing · deselect · back to Select"),
                     ("Species: type, ↑↓, Enter", "Pick species; Enter again = done, draw next"),
                     ("Ctrl+D", "Same attributes as last annotation"),
+                    ("N", "Next annotation that needs a species"),
+                    ("Shift+click / Shift+drag", "Add to selection / lasso select"),
+                    ("Ctrl+A", "Select all (then bulk edit in the panel)"),
+                    ("↑ / ↓ over the table", "Previous / next row"),
                     ("Del", "Delete selected annotation"),
                     ("Alt+click vertex", "Remove that vertex"),
                     ("Drag small dot", "Insert a vertex"),
@@ -1282,6 +1313,23 @@ impl eframe::App for CatApp {
             }
             if let Some(b) = ev.zoom_to {
                 self.zoom_to_bbox(b);
+            }
+            if let (Some(u), Some(p)) = (&ev.hovered, out.resp.hover_pos()) {
+                if let Some(a) = self.editor.get(u) {
+                    let code = a.spcode();
+                    let name = self.form.species.get(&code).map(|s| s.name.clone()).unwrap_or_default();
+                    let mut text = if code.is_empty() { format!("{} · needs species", a.kind.label()) } else { format!("{code}  {name}") };
+                    let morph = a.text("morph_code");
+                    if !morph.is_empty() {
+                        text.push_str(&format!(" · {morph}"));
+                    }
+                    text.push_str(&format!(" · {}", editor::size_text(a)));
+                    let painter = ui.painter_at(out.rect);
+                    let galley = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), Color32::WHITE);
+                    let r = egui::Rect::from_min_size(p + egui::vec2(16.0, 16.0), galley.size() + egui::vec2(12.0, 6.0));
+                    painter.rect_filled(r, 4.0, Color32::from_black_alpha(210));
+                    painter.galley(r.min + egui::vec2(6.0, 3.0), galley, Color32::WHITE);
+                }
             }
             map::scale_bar(&ui.painter_at(out.rect), out.rect, &self.cam);
             self.tool_bar(ui, out.rect);

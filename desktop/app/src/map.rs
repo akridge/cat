@@ -123,7 +123,7 @@ pub fn map_ui(ui: &mut egui::Ui, cam: &mut Camera, layers: &[Layer], tiles: &mut
             cam.zoom_at(rect, p, 2.0, min_mpp);
         }
     }
-    if !ui.ctx().egui_wants_keyboard_input() {
+    if !ui.ctx().egui_wants_keyboard_input() && resp.hovered() {
         let step = 120.0 * cam.mpp;
         ui.input(|i| {
             if i.key_pressed(egui::Key::ArrowLeft) { cam.cx -= step }

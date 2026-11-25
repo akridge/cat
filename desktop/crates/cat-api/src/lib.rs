@@ -40,6 +40,24 @@ impl ApiError {
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
+/// Network error with its underlying cause ("connection refused",
+/// "invalid peer certificate", "dns error" …), which is what helps when
+/// diagnosing agency networks and proxies.
+fn net_err(e: reqwest::Error) -> ApiError {
+    let e = e.without_url();
+    let mut msg = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(s) = src {
+        let t = s.to_string();
+        if !msg.contains(&t) {
+            msg.push_str(": ");
+            msg.push_str(&t);
+        }
+        src = s.source();
+    }
+    ApiError::Network(msg)
+}
+
 /// Field name → enabled (value, label) options.
 pub type OptionLists = Vec<(String, Vec<(String, String)>)>;
 
@@ -236,7 +254,7 @@ impl Client {
             Some(c) => req.header("Cookie", c),
             None => req,
         };
-        let resp = req.send().map_err(|e| ApiError::Network(e.without_url().to_string()))?;
+        let resp = req.send().map_err(net_err)?;
         let status = resp.status().as_u16();
         let text = resp.text().map_err(|e| ApiError::Network(e.to_string()))?;
         let body: Value = serde_json::from_str(&text).unwrap_or(Value::String(text.chars().take(300).collect()));
@@ -270,7 +288,7 @@ impl Client {
             .post(self.url("/api/auth/login"))
             .json(&json!({"username": username, "password": password}))
             .send()
-            .map_err(|e| ApiError::Network(e.without_url().to_string()))?;
+            .map_err(net_err)?;
         let status = resp.status().as_u16();
         let cookie = resp
             .headers()

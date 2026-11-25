@@ -38,6 +38,9 @@ pub struct Form {
     focus_species: bool,
     /// Attributes of the last annotation edited, for "Same as last".
     pub last_props: Option<Map<String, Value>>,
+    bulk_field: usize,
+    bulk_text: String,
+    bulk_species: String,
 }
 
 impl Form {
@@ -53,6 +56,9 @@ impl Form {
             show_suggestions: false,
             focus_species: false,
             last_props: None,
+            bulk_field: 0,
+            bulk_text: String::new(),
+            bulk_species: String::new(),
         }
     }
 
@@ -167,6 +173,10 @@ impl Form {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, editor: &mut Editor, settings: &mut Settings) -> FormAction {
         self.sync(editor);
+        if editor.multi.len() > 1 {
+            self.bulk_ui(ui, editor, settings);
+            return FormAction::None;
+        }
         let Some(a) = editor.selected_ann().cloned() else {
             ui.add_space(8.0);
             ui.weak("Select or draw an annotation to edit its attributes.");
@@ -442,5 +452,102 @@ impl Form {
                 }
             }
         }
+    }
+}
+
+impl Form {
+    /// Bulk attribute editing for a multi-selection (one undo step per apply).
+    fn bulk_ui(&mut self, ui: &mut egui::Ui, editor: &mut Editor, settings: &mut Settings) {
+        let n = editor.multi.len();
+        let complete = editor.multi.iter().filter_map(|u| editor.get(u)).filter(|a| a.is_complete()).count();
+        ui.heading(format!("{n} annotations selected"));
+        ui.label(format!("{complete} complete · {} need species", n - complete));
+        if editor.read_only {
+            ui.colored_label(Color32::from_rgb(230, 180, 0), "👁 View only");
+            ui.disable();
+        }
+        ui.horizontal(|ui| {
+            if ui.button(format!("🗑 Delete {n}")).clicked() {
+                editor.delete_multi();
+            }
+            if ui.button("Clear selection (Esc)").clicked() {
+                editor.multi.clear();
+            }
+        });
+        ui.separator();
+
+        ui.label(RichText::new("Set species on all").strong());
+        ui.add(egui::TextEdit::singleline(&mut self.bulk_species).hint_text("type code or name").desired_width(f32::INFINITY));
+        let matches: Vec<(String, String)> =
+            self.species.search(&self.bulk_species, &settings.recent_species, 6).into_iter().map(|s| (s.code.clone(), s.name.clone())).collect();
+        for (code, name) in matches {
+            if ui.add(egui::Button::new(RichText::new(format!("{code:<6} {name}")).monospace()).min_size(egui::vec2(ui.available_width(), 0.0))).clicked() {
+                let k = editor.bulk_set("spcode", Some(Value::String(code.clone())));
+                settings.use_species(&code);
+                editor.toast = Some((format!("Species {code} set on {k}"), std::time::Instant::now()));
+                self.bulk_species.clear();
+            }
+        }
+        ui.separator();
+
+        ui.label(RichText::new("Set a field on all").strong());
+        let fields: Vec<Field> = self.fields.iter().filter(|f| f.kind != FieldKind::Species).cloned().collect();
+        self.bulk_field = self.bulk_field.min(fields.len() - 1);
+        egui::ComboBox::from_id_salt("bulk-field").selected_text(fields[self.bulk_field].label).width(200.0).show_ui(ui, |ui| {
+            for (i, f) in fields.iter().enumerate() {
+                if ui.selectable_label(i == self.bulk_field, f.label).clicked() {
+                    self.bulk_field = i;
+                    self.bulk_text.clear();
+                }
+            }
+        });
+        let f = fields[self.bulk_field].clone();
+        let mut apply: Option<String> = None;
+        ui.horizontal_wrapped(|ui| match f.kind {
+            FieldKind::YesNo => {
+                if ui.button("No").clicked() {
+                    apply = Some("0".into());
+                }
+                if ui.button("Yes").clicked() {
+                    apply = Some("-1".into());
+                }
+            }
+            FieldKind::Choice { free: false } => {
+                for (v, l) in &f.options {
+                    if ui.button(l).clicked() {
+                        apply = Some(v.clone());
+                    }
+                }
+            }
+            _ => {
+                ui.add(egui::TextEdit::singleline(&mut self.bulk_text).desired_width(140.0));
+                if !f.options.is_empty() {
+                    egui::ComboBox::from_id_salt("bulk-opts").selected_text("").width(24.0).show_ui(ui, |ui| {
+                        for (v, l) in &f.options {
+                            if ui.selectable_label(false, l).clicked() {
+                                self.bulk_text = v.clone();
+                            }
+                        }
+                    });
+                }
+                if ui.button("Apply").clicked() {
+                    apply = Some(self.bulk_text.clone());
+                }
+            }
+        });
+        if ui.small_button("Clear this field on all").clicked() {
+            apply = Some(String::new());
+        }
+        if let Some(text) = apply {
+            match fields::parse_field(&f, &text) {
+                Ok(v) => {
+                    let k = editor.bulk_set(f.key, v);
+                    editor.toast = Some((format!("{} set on {k}", f.label), std::time::Instant::now()));
+                }
+                Err(e) => editor.toast = Some((format!("{} needs a {e}", f.label), std::time::Instant::now())),
+            }
+        }
+        ui.separator();
+        ui.weak("Shift+click adds/removes · Shift+drag lassoes · Ctrl+A selects all · Ctrl+Z undoes a bulk change");
     }
 }

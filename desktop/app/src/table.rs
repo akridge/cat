@@ -120,7 +120,7 @@ pub fn table_ui(ui: &mut egui::Ui, editor: &mut Editor, st: &mut TableState, spe
         .body(|body| {
             body.rows(20.0, rows.len(), |mut row| {
                 let (num, a) = rows[row.index()];
-                row.set_selected(editor.selected.as_deref() == Some(a.uuid.as_str()));
+                row.set_selected(editor.selected.as_deref() == Some(a.uuid.as_str()) || editor.multi.contains(&a.uuid));
                 row.col(|ui| {
                     ui.label(format!("{}", num + 1));
                 });
@@ -164,7 +164,39 @@ pub fn table_ui(ui: &mut egui::Ui, editor: &mut Editor, st: &mut TableState, spe
             st.asc = true;
         }
     }
+    let (add, up, down, over) = ui.input(|i| {
+        (i.modifiers.command || i.modifiers.shift, i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown), i.pointer.hover_pos())
+    });
+    // ↑/↓ step through rows while the pointer is over the table.
+    let hovered = over.is_some_and(|p| ui.max_rect().contains(p));
+    if hovered && (up || down) && clicked.is_none() && !rows.is_empty() {
+        let cur = editor.selected.as_ref().and_then(|u| rows.iter().position(|r| &r.1.uuid == u));
+        let next = match cur {
+            Some(i) if down => (i + 1).min(rows.len() - 1),
+            Some(i) => i.saturating_sub(1),
+            None => 0,
+        };
+        clicked = Some(rows[next].1.uuid.clone());
+    }
     if let Some(u) = &clicked {
+        if add {
+            if editor.multi.is_empty() {
+                if let Some(s) = editor.selected.take() {
+                    editor.multi.push(s);
+                }
+            }
+            match editor.multi.iter().position(|m| m == u) {
+                Some(i) => {
+                    editor.multi.remove(i);
+                }
+                None => editor.multi.push(u.clone()),
+            }
+            if editor.multi.len() == 1 {
+                editor.selected = editor.multi.pop();
+            }
+            return None;
+        }
+        editor.multi.clear();
         editor.selected = Some(u.clone());
         st.last_selected = Some(u.clone());
     }

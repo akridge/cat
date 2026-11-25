@@ -77,6 +77,8 @@ enum Drag {
     Vertex { uuid: String, idx: usize, before: Annotation },
     Body { uuid: String, before: Annotation, last: [f64; 2] },
     RectDraw { start: [f64; 2] },
+    /// Shift+drag freehand selection (screen points).
+    Lasso { pts: Vec<Pos2> },
 }
 
 /// What the app should react to after a frame.
@@ -86,6 +88,8 @@ pub struct Events {
     pub created: Option<String>,
     /// User asked to zoom to the selection.
     pub zoom_to: Option<[f64; 4]>,
+    /// Annotation under the pointer (Select tool), for a tooltip.
+    pub hovered: Option<String>,
 }
 
 pub struct Editor {
@@ -93,6 +97,8 @@ pub struct Editor {
     pub items: Vec<Annotation>,
     pub history: History,
     pub selected: Option<String>,
+    /// Multi-selection (Shift+click, lasso, Ctrl+A) for bulk edits.
+    pub multi: Vec<String>,
     pub snap: bool,
     pub style: Style,
     /// Bumped on every change; the app autosaves when it moves.
@@ -143,6 +149,7 @@ impl Editor {
             items: Vec::new(),
             history: History::default(),
             selected: None,
+            multi: Vec::new(),
             snap: true,
             style: Style::default(),
             rev: 0,
@@ -165,6 +172,7 @@ impl Editor {
         self.items = items;
         self.history.clear();
         self.selected = None;
+        self.multi.clear();
         self.drawing.clear();
         self.drag = None;
         self.tri_cache.clear();
@@ -238,6 +246,58 @@ impl Editor {
             self.selected = None;
             self.toast("Deleted · Ctrl+Z to undo");
         }
+    }
+
+    /// Select the next annotation without a species (after the current one).
+    pub fn next_incomplete(&mut self) -> Option<[f64; 4]> {
+        let start = self.selected.as_ref().and_then(|u| self.items.iter().position(|a| &a.uuid == u)).map(|i| i + 1).unwrap_or(0);
+        let n = self.items.len();
+        let found = (0..n).map(|k| (start + k) % n.max(1)).find(|&i| !self.items[i].is_complete());
+        match found {
+            Some(i) => {
+                self.multi.clear();
+                self.selected = Some(self.items[i].uuid.clone());
+                Some(self.items[i].geom.bbox())
+            }
+            None => {
+                self.toast("Every annotation has a species ✔");
+                None
+            }
+        }
+    }
+
+    pub fn delete_multi(&mut self) {
+        if self.read_only || self.multi.is_empty() {
+            return;
+        }
+        let changes: Vec<Change> = self.multi.iter().filter_map(|u| self.get(u).cloned()).map(|a| Change { before: Some(a), after: None }).collect();
+        let n = changes.len();
+        self.commit(&format!("Delete {n} annotations"), changes);
+        self.multi.clear();
+        self.selected = None;
+        self.toast(format!("Deleted {n} · Ctrl+Z to undo"));
+    }
+
+    /// Set (or clear) one property on every multi-selected annotation.
+    pub fn bulk_set(&mut self, key: &str, value: Option<Value>) -> usize {
+        if self.read_only {
+            return 0;
+        }
+        let mut changes = Vec::new();
+        for u in &self.multi {
+            if let Some(a) = self.get(u) {
+                let mut b = a.clone();
+                match &value {
+                    Some(v) => b.props.insert(key.to_string(), v.clone()),
+                    None => b.props.remove(key),
+                };
+                b.touch();
+                changes.push(Change { before: Some(a.clone()), after: Some(b) });
+            }
+        }
+        let n = changes.len();
+        self.commit(&format!("Set {key} on {n}"), changes);
+        n
     }
 
     fn finish(&mut self, kind: AnnKind, pts: Vec<[f64; 2]>, active_secs: f64) -> Option<String> {
@@ -341,8 +401,8 @@ impl Editor {
     /// Called before the map handles input: may claim the primary drag.
     /// Returns whether the map may pan with the primary button.
     pub fn pre_input(&mut self, ui: &egui::Ui, rect: Rect, cam: &Camera) -> bool {
-        let (pressed, origin, space, alt) = ui.input(|i| {
-            (i.pointer.primary_pressed(), i.pointer.press_origin(), i.key_down(egui::Key::Space), i.modifiers.alt)
+        let (pressed, origin, space, alt, shift) = ui.input(|i| {
+            (i.pointer.primary_pressed(), i.pointer.press_origin(), i.key_down(egui::Key::Space), i.modifiers.alt, i.modifiers.shift)
         });
         if space {
             return true;
@@ -351,6 +411,7 @@ impl Editor {
             if let Some(o) = origin.filter(|o| rect.contains(*o)) {
                 match self.tool {
                     Tool::Rect => self.drag = Some(Drag::RectDraw { start: Self::world(cam, rect, o) }),
+                    Tool::Select if shift => self.drag = Some(Drag::Lasso { pts: vec![o] }),
                     Tool::Select if !alt => self.start_select_drag(cam, rect, o),
                     _ => {}
                 }
@@ -433,13 +494,22 @@ impl Editor {
             }
             if back && !self.drawing.is_empty() {
                 self.drawing.pop();
+            } else if (back || del) && self.drawing.is_empty() && self.multi.len() > 1 {
+                self.delete_multi();
             } else if (back || del) && self.drawing.is_empty() && self.selected.is_some() {
                 self.delete_selected();
+            }
+            if ui.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::A))) {
+                self.multi = self.items.iter().map(|a| a.uuid.clone()).collect();
+                self.selected = None;
+                self.toast(format!("{} selected · set attributes in the panel, Del to delete", self.multi.len()));
             }
             if esc {
                 if self.is_drawing() {
                     self.drawing.clear();
                     self.drag = None;
+                } else if !self.multi.is_empty() {
+                    self.multi.clear();
                 } else if self.selected.is_some() {
                     self.selected = None;
                 } else {
@@ -504,9 +574,28 @@ impl Editor {
             Tool::Select => {
                 if clicked {
                     if let Some(h) = hover {
+                        let shift = ui.input(|i| i.modifiers.shift);
                         if alt {
                             self.alt_click_vertex(cam, rect, h);
+                        } else if shift {
+                            if let Some(u) = self.hit(cam, rect, h) {
+                                if self.multi.is_empty() {
+                                    if let Some(s) = self.selected.take() {
+                                        self.multi.push(s);
+                                    }
+                                }
+                                match self.multi.iter().position(|m| *m == u) {
+                                    Some(i) => {
+                                        self.multi.remove(i);
+                                    }
+                                    None => self.multi.push(u),
+                                }
+                                if self.multi.len() == 1 {
+                                    self.selected = self.multi.pop();
+                                }
+                            }
                         } else {
+                            self.multi.clear();
                             self.selected = self.hit(cam, rect, h);
                         }
                     }
@@ -517,6 +606,9 @@ impl Editor {
                     }
                 }
                 self.update_select_drag(resp, cam, rect, snap);
+                if self.drag.is_none() {
+                    ev.hovered = hover.and_then(|h| self.hit(cam, rect, h)).filter(|u| Some(u) != self.selected.as_ref());
+                }
             }
         }
 
@@ -646,6 +738,49 @@ impl Editor {
                 }
             }
             Drag::RectDraw { .. } => {}
+            Drag::Lasso { mut pts } => {
+                if let Some(p) = pointer {
+                    if pts.last().is_none_or(|l| l.distance(p) > 3.0) {
+                        pts.push(p);
+                    }
+                }
+                if released {
+                    if pts.len() >= 3 {
+                        let poly: Vec<[f64; 2]> = pts.iter().map(|p| [p.x as f64, p.y as f64]).collect();
+                        let mut hits = Vec::new();
+                        for a in &self.items {
+                            let sp = Self::screen_pts(cam, rect, a);
+                            let c = match &a.geom {
+                                Geom::Polygon(_) => {
+                                    let r: Vec<[f64; 2]> = sp.iter().map(|p| [p.x as f64, p.y as f64]).collect();
+                                    geom::centroid(&r)
+                                }
+                                _ => [sp[sp.len() / 2].x as f64, sp[sp.len() / 2].y as f64],
+                            };
+                            if geom::point_in_polygon(c, &poly) {
+                                hits.push(a.uuid.clone());
+                            }
+                        }
+                        for u in hits {
+                            if !self.multi.contains(&u) {
+                                self.multi.push(u);
+                            }
+                        }
+                        if let Some(s) = self.selected.take() {
+                            if !self.multi.contains(&s) {
+                                self.multi.insert(0, s);
+                            }
+                        }
+                        if self.multi.len() == 1 {
+                            self.selected = self.multi.pop();
+                        } else if !self.multi.is_empty() {
+                            self.toast(format!("{} selected", self.multi.len()));
+                        }
+                    }
+                } else {
+                    self.drag = Some(Drag::Lasso { pts });
+                }
+            }
         }
     }
 
@@ -677,7 +812,7 @@ impl Editor {
             if hi[0] < view.min_x || lo[0] > view.max_x || hi[1] < view.min_y || lo[1] > view.max_y {
                 continue;
             }
-            let selected = self.selected.as_deref() == Some(a.uuid.as_str());
+            let selected = self.selected.as_deref() == Some(a.uuid.as_str()) || self.multi.contains(&a.uuid);
             let base = if a.is_complete() { rgb(self.style.complete) } else { rgb(self.style.incomplete) };
             let color = if selected { Color32::from_rgb(0, 230, 255) } else { base };
             let pts = Self::screen_pts(cam, rect, a);
@@ -719,7 +854,7 @@ impl Editor {
                     labels.push((c, code));
                 }
             }
-            if selected {
+            if selected && self.multi.is_empty() {
                 self.paint_handles(painter, a, &pts);
             }
         }
@@ -753,6 +888,14 @@ impl Editor {
     fn paint_drawing(&self, painter: &egui::Painter, cam: &Camera, rect: Rect, hover: Option<Pos2>, cursor_world: Option<[f64; 2]>) {
         let accent = Color32::from_rgb(0, 230, 255);
         let s = |m: &[f64; 2]| cam.to_screen(rect, m[0], m[1]);
+        if let Some(Drag::Lasso { pts }) = &self.drag {
+            if pts.len() >= 2 {
+                let mut closed = pts.clone();
+                closed.push(pts[0]);
+                painter.add(Shape::dashed_line(&closed, Stroke::new(1.5, accent), 6.0, 4.0));
+            }
+            return;
+        }
         if let Some(Drag::RectDraw { start }) = &self.drag {
             if let Some(end) = cursor_world {
                 let r = Rect::from_two_pos(s(start), s(&end));

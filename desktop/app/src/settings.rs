@@ -85,7 +85,16 @@ impl Settings {
         data_dir().join("settings.json")
     }
     pub fn load() -> Settings {
-        std::fs::read_to_string(Self::path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+        let mut s: Settings = std::fs::read_to_string(Self::path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        // Drop unusable server profiles (e.g. from an aborted sign-in).
+        let valid = |p: &crate::server::ServerProfile| {
+            let host = p.url.trim_start_matches("https://").trim_start_matches("http://");
+            !host.trim().is_empty() && !p.username.trim().is_empty()
+        };
+        let current = s.server.and_then(|i| s.servers.get(i).cloned());
+        s.servers.retain(valid);
+        s.server = current.and_then(|c| s.servers.iter().position(|p| *p == c));
+        s
     }
     pub fn save(&self) {
         if let Ok(t) = serde_json::to_string_pretty(self) {
