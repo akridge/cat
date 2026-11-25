@@ -817,12 +817,21 @@ impl Editor {
             let color = if selected { Color32::from_rgb(0, 230, 255) } else { base };
             let pts = Self::screen_pts(cam, rect, a);
             let stroke = Stroke::new(if selected { lw + 1.0 } else { lw }, color);
+            // Zoomed out, a whole annotation can shrink to a few pixels: draw a dot.
+            let bb = Rect::from_points(&pts);
+            if !matches!(a.geom, Geom::Point(_)) && bb.width().max(bb.height()) < 4.0 {
+                painter.circle_filled(bb.center(), 2.0, color);
+                continue;
+            }
+            // Outline through vertices at least ~1 px apart: near-duplicate
+            // vertices make razor-sharp joins whose mitres shoot off-screen.
+            let outline = thin(&pts, 1.2);
             match &a.geom {
                 Geom::Point(_) => {
                     painter.circle(pts[0], 5.5, color, Stroke::new(1.5, Color32::WHITE));
                 }
                 Geom::Line(_) => {
-                    painter.add(Shape::line(pts.clone(), stroke));
+                    painter.add(Shape::line(outline, stroke));
                 }
                 Geom::Polygon(_) => {
                     let tris = self.triangles(a);
@@ -835,7 +844,9 @@ impl Editor {
                         mesh.indices = tris;
                         painter.add(Shape::mesh(mesh));
                     }
-                    painter.add(Shape::closed_line(pts.clone(), stroke));
+                    if outline.len() >= 3 {
+                        painter.add(Shape::closed_line(outline, stroke));
+                    }
                 }
             }
             if self.style.labels {
@@ -941,6 +952,17 @@ impl Editor {
             measure_label(painter, h + vec2(14.0, 14.0), &text);
         }
     }
+}
+
+/// Drop points closer than `min_px` to the previously kept one.
+fn thin(pts: &[Pos2], min_px: f32) -> Vec<Pos2> {
+    let mut out: Vec<Pos2> = Vec::with_capacity(pts.len());
+    for p in pts {
+        if out.last().is_none_or(|l| l.distance(*p) >= min_px) {
+            out.push(*p);
+        }
+    }
+    out
 }
 
 fn dims(r: &[LonLat]) -> String {

@@ -43,6 +43,9 @@ cargo run --release -p cat-desktop -- gs://nmfs_odp_pifsc/PIFSC/ESD/ARP/StRS_Sit
 Windows builds come from GitHub Actions (`.github/workflows/desktop.yml`) as
 `CAT-<version>-<sha>-win64-portable.zip`.
 
+`CAT_PERF=1` logs CPU time per frame to stderr (2,000 visible polygons
+measure about 5–6 ms per frame in a release build).
+
 `CAT_RENDERER=glow` switches from the default wgpu renderer (DirectX 12 on
 Windows) to OpenGL.
 

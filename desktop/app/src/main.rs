@@ -1249,6 +1249,7 @@ fn fmt_duration(s: f64) -> String {
 
 impl eframe::App for CatApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let frame_start = Instant::now();
         let ctx = ui.ctx().clone();
         let had_input = ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving());
         self.timer.tick(had_input);
@@ -1384,6 +1385,10 @@ impl eframe::App for CatApp {
             self.persist();
         }
         ctx.request_repaint_after(Duration::from_secs(3));
+        // CAT_PERF=1: log CPU time per frame (for performance checks).
+        if std::env::var_os("CAT_PERF").is_some() {
+            eprintln!("frame_ms {:.2} items {}", frame_start.elapsed().as_secs_f64() * 1000.0, self.editor.items.len());
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
